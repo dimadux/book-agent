@@ -89,9 +89,13 @@ def build_gutendex_url(
     languages: str | None,
     topic: str | None,
     search: str | None,
-    sort: str,
+    sort: str | None,
 ) -> str:
-    params = {"page": str(page), "sort": sort}
+    params = {"page": str(page)}
+    if sort:
+        params["sort"] = sort
+    if languages:
+        params["languages"] = languages
     if languages:
         params["languages"] = languages
     if topic:
@@ -142,7 +146,7 @@ def iter_gutendex_books(
     languages: str | None,
     topic: str | None,
     search: str | None,
-    sort: str,
+    sort: str | None,
     page_delay_seconds: float,
     max_pages: int | None,
 ) -> Iterable[BookRecord]:
@@ -159,6 +163,7 @@ def iter_gutendex_books(
             search=search,
             sort=sort,
         )
+        print(url)
         payload = fetch_json(url)
         results = payload.get("results", [])
         if not results:
@@ -296,10 +301,10 @@ def upsert_integrated(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Ingest Gutendex books into Pinecone.")
     parser.add_argument("--limit", type=int, default=1000)
-    parser.add_argument("--languages", default="en")
+    parser.add_argument("--languages", default=None)
     parser.add_argument("--topic", default=None)
     parser.add_argument("--search", default=None)
-    parser.add_argument("--sort", default="popular", choices=["popular", "ascending", "descending"])
+    parser.add_argument("--sort", default=None, choices=["popular", "ascending", "descending"])
     parser.add_argument("--batch-size", type=int, default=96)
     parser.add_argument("--page-delay", type=float, default=1.0)
     parser.add_argument("--batch-delay", type=float, default=1.0)
