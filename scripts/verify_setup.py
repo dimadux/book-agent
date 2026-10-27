@@ -30,7 +30,7 @@ def main() -> None:
         import langgraph  # noqa: F401
         import langchain_core  # noqa: F401
     except ImportError as exc:
-        errors.append(f"Missing dependency: {exc.name}. Run: pip install -r requirements.txt")
+        errors.append(f"Missing dependency: {exc.name}. Run: uv sync")
 
     # 3. .env and Pinecone key
     try:

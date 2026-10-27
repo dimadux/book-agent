@@ -26,8 +26,10 @@ backend/app/services/book_agent.py
 
 ## Quick start
 
+Dependencies are managed with [uv](https://docs.astral.sh/uv/) (`pyproject.toml` + `uv.lock`).
+
 ```bash
-make setup        # creates venv, installs deps, copies .env
+make setup        # creates .venv, installs locked deps, copies .env
 # Edit .env — set PINECONE_API_KEY (provided to you) and your LLM key
 make verify       # checks Python, deps, Pinecone connectivity
 make run          # starts server at http://127.0.0.1:8000
@@ -36,16 +38,14 @@ make run          # starts server at http://127.0.0.1:8000
 Or manually:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+uv sync
 cp .env.example .env
 # edit .env
-python scripts/verify_setup.py
-python scripts/run_dev.py
+uv run scripts/verify_setup.py
+uv run scripts/run_dev.py
 ```
 
-**Requirements:** Python 3.11+
+**Requirements:** Python 3.11+ and uv
 
 ## Candidate task
 
@@ -74,13 +74,15 @@ Suggest a book for someone who loved "The Count of Monte Cristo"
 
 ### LLM provider
 
-Choose any LLM and install it yourself:
+Choose any LLM and add its SDK to the project:
 
 ```bash
-pip install openai           # OpenAI GPT-4o, GPT-4.1, etc.
-pip install anthropic        # Claude
-pip install ollama           # local models via Ollama
+uv add openai                # OpenAI GPT-4o, GPT-4.1, etc.
+uv add anthropic             # Claude
+uv add ollama                # local models via Ollama
 ```
+
+Or install one of the predefined extras without changing `pyproject.toml`, e.g. `uv sync --extra openai`.
 
 Add the API key to `.env`. The starter code does not assume any particular model.
 
