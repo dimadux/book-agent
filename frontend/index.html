@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Book Recommendation Agent</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  </head>
+  <body>
+    <main class="app">
+      <section class="panel">
+        <header class="header">
+          <div>
+            <h1>Book Recommendation Agent</h1>
+            <p>Starter UI for testing streamed RAG responses over the books index.</p>
+          </div>
+        </header>
+
+        <div id="messages" class="messages" aria-live="polite">
+          <div class="message assistant">
+            <div class="role">Assistant</div>
+            <div class="bubble">
+              Ask for a recommendation, for example:
+              <br />
+              <button class="example" type="button">
+                Recommend a dark classic book about obsession and revenge
+              </button>
+              <button class="example" type="button">
+                Find books by Shakespeare
+              </button>
+              <button class="example" type="button">
+                Suggest popular adventure books for teenagers
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <form id="chat-form" class="composer">
+          <textarea
+            id="chat-input"
+            name="message"
+            rows="2"
+            placeholder="Describe the book you want..."
+            required
+          ></textarea>
+          <button id="send-button" type="submit">Send</button>
+        </form>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

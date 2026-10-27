@@ -1,0 +1,19 @@
+[project]
+name = "book-indexer"
+version = "0.1.0"
+description = "Build a Pinecone books index from Gutendex metadata."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "pinecone>=7.0.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.6.0",
+    "python-dotenv>=1.0.1",
+    "typing-extensions>=4.12.2",
+    "uvicorn[standard]>=0.32.0",
+    "langgraph>=0.4.0",
+    "langchain-core>=0.3.0",
+]
+
+[tool.ruff]
+line-length = 100
