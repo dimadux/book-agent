@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 LLM_TIMEOUT_SECONDS = 20
 # Classification and extraction should give the same plan for the same request.
 TEMPERATURE = 0
-DEFAULT_FALLBACK_MODEL = "gpt-4.1"
+DEFAULT_FALLBACK_MODEL = "gpt-5.6-luna"
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -31,7 +31,7 @@ def get_llm_client() -> AsyncOpenAI:
 
 
 def get_llm_model() -> str:
-    return os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    return os.getenv("OPENAI_MODEL", "gpt-6-luna")
 
 
 def llm_models() -> list[str]:
@@ -52,7 +52,6 @@ async def structured(instructions: str, messages: list[ChatMessage], schema: typ
                 instructions=instructions,
                 input=recent_conversation(messages),
                 text_format=schema,
-                temperature=TEMPERATURE,
             )
         except Exception:
             logger.exception("%s call failed on %s", schema.__name__, model)

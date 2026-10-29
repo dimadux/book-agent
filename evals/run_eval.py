@@ -390,7 +390,7 @@ def main() -> int:
     parser.add_argument("--refresh-catalogue", action="store_true")
     args = parser.parse_args()
 
-    if args.refresh_catalogue:
+    if args.refresh_catalogue or not CATALOGUE.exists():
         refresh_catalogue()
     catalogue = load_catalogue()
     cases = json.loads(DATASET.read_text())

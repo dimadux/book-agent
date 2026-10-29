@@ -48,13 +48,24 @@ def test_wrong_author_relaxes_only_the_author(agent):
         agent, SearchPlan(query="travel", authors=["Twian, Mark"], published_before=1800)
     )
     assert titles(state) == ["Humphry Clinker"] and state["relaxed_filters"] == ["author"]
-    # The strict search, then the smaller sets at once: {author}, {years}, {}. The concurrent
-    # calls land in any order; once the author is not filtered on, the name moves into the text.
-    assert len(agent.catalogue.calls) == 4
-    queries = {
-        query for query, filters, _ in agent.catalogue.calls if "authors" not in str(filters)
-    }
-    assert queries == {"travel by Twian, Mark"}
+    # The strict search, the name lookup (no catalogue spelling is close enough), then the
+    # smaller sets at once: {author}, {years}, {}. The concurrent calls land in any order; once
+    # the author is not filtered on, the name moves into the text.
+    assert len(agent.catalogue.calls) == 5 and agent.catalogue.calls[1][:2] == ("Twian, Mark", None)
+    queries = {query for query, _, _ in agent.catalogue.calls}
+    assert "travel by Twian, Mark" in queries
+
+
+def test_author_spelt_differently_is_resolved_before_relaxing(agent):
+    state = run_search(agent, SearchPlan(query="travel", authors=["Mark Twain"]))
+    assert titles(state) == ["Roughing It"] and state["relaxed_filters"] == []
+    assert state["plan"].authors == ["Twain, Mark"]
+    # Strict search, name lookup, strict search again with the catalogue's spelling.
+    assert [filters for _, filters, _ in agent.catalogue.calls] == [
+        {"authors": {"$in": ["Mark Twain"]}},
+        None,
+        {"authors": {"$in": ["Twain, Mark"]}},
+    ]
 
 
 def test_drops_as_few_constraints_as_possible(agent):
@@ -95,7 +106,8 @@ def test_nothing_matches_anything(agent):
         "language",
         "author",
     ]
-    assert len(agent.catalogue.calls) == 1 + 7 and None in agent.catalogue.filters
+    # Strict, the author lookup, then the 7 smaller sets.
+    assert len(agent.catalogue.calls) == 1 + 1 + 7 and None in agent.catalogue.filters
 
 
 def test_single_constraint_and_no_constraints(agent):
@@ -191,7 +203,12 @@ def test_title_and_author_matching():
     assert not same_title("Frankenstein", "Frankensteinia") and not same_title("", "X")
     assert same_author("Conan Doyle, Arthur", "Doyle, Arthur Conan")
     assert same_author("Shelley, Mary", "Shelley, Mary Wollstonecraft")
+    assert same_author("Dostoevsky", "Dostoyevsky, Fyodor")
+    assert same_author("H. G. Wells", "Wells, H. G. (Herbert George)")
+    assert same_author("Bronte, Emily", "Brontë, Emily")
     assert not same_author("King, Stephen", "Kingsley, Charles") and not same_author("", "X")
+    assert not same_author("Poe", "Pope, Alexander")  # short words must match exactly
+    assert not same_author("Arthur", "Doyle, Arthur Conan")  # the surname must be given
 
 
 def test_exclusions_by_title_and_author():

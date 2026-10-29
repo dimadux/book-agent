@@ -78,11 +78,11 @@ def test_reranked_shortlist_reaches_the_answer(agent, monkeypatch):
     )
     out = agent.run("dark revenge stories by Nobody")
     prompt = fake.prompt(Answer)
-    assert sent == [("dark revenge stories", 30)]  # the reranker sees the plan's query
+    assert sent == [("dark revenge stories by Nobody", 40)]  # the reranker gets the user's words
     assert (
         '"id": "gutenberg:29"' in prompt
         and '"id": "gutenberg:0"' not in prompt
-        and prompt.count('"id": "gutenberg:') == 10
+        and prompt.count('"id": "gutenberg:') == 16
     )
     assert "Book 29" in out
 

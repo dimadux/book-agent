@@ -74,7 +74,8 @@ language. The language the user writes in does not count.
 - published_after / published_before: years, only when the user gives a time \
 constraint, e.g. "before 1900" -> published_before 1900, "19th century" -> 1800 and \
 1899.
-- prefer_popular: true when the user asks for popular, famous, well-known or classic titles.
+- prefer_popular: true only when the user asks for popular, famous, well-known or bestselling \
+titles. A genre or the word "classic" alone does not count.
 - exclude_titles: titles the user named as a reference or said they already read. Books \
 recommended earlier are excluded automatically; do not list them.
 Only put authors and titles in these fields when they are named: in the latest message, \
@@ -135,7 +136,8 @@ async def plan_node(state: AgentState) -> AgentState:
     if decision.intent != "book_request":
         return {"reply": FIXED_REPLIES[decision.intent]}
 
-    plan = keep_mentioned_names(sanitize(decision.plan or SearchPlan(query=message)), messages)
+    plan = sanitize(decision.plan or SearchPlan(query=message))
+    plan = keep_requested_languages(keep_mentioned_names(plan, messages), messages)
     logger.info("Search plan: %s", plan.model_dump_json())
     return {"plan": plan}
 
@@ -208,12 +210,8 @@ def keep_mentioned_names(plan: SearchPlan, messages: list[ChatMessage]) -> Searc
     message; earlier turns count only for a follow-up ("more by him"). `exclude_*` are
     standing preferences ("no Dickens"), so the whole recent conversation counts.
     """
-    latest = last_user_message(messages)
     in_conversation = words_in(turn["content"] for turn in recent_conversation(messages))
-    # The model also marks fresh requests as follow-ups ("something gothic" after a Twain
-    # request), so the message itself must point back to earlier turns.
-    follows_up = plan.follows_up and BACK_REFERENCE.search(latest)
-    in_request = in_conversation if follows_up else words_in([latest])
+    in_request = words_in([request_text(plan, messages)])
 
     def authors(names: list[str], said: set[str]) -> list[str]:
         # The surname is what people write: "Doyle, Arthur Conan" is "Conan Doyle".
@@ -235,6 +233,75 @@ def keep_mentioned_names(plan: SearchPlan, messages: list[ChatMessage]) -> Searc
     if kept != plan:
         logger.info("Dropped names not mentioned for this request: %s", plan.model_dump_json())
     return kept
+
+
+def request_text(plan: SearchPlan, messages: list[ChatMessage]) -> str:
+    """The latest message, or the recent conversation when the message follows up on it. The
+    model also marks fresh requests as follow-ups ("something gothic" after a Twain request),
+    so the message itself must point back to earlier turns."""
+    latest = last_user_message(messages)
+    if plan.follows_up and BACK_REFERENCE.search(latest):
+        return "\n".join(turn["content"] for turn in recent_conversation(messages))
+    return latest
+
+
+# Names of the catalogue's languages, as users write them in the languages they write in.
+LANGUAGE_NAMES = {
+    "en": ["english", "anglais", "inglés", "ingles", "englisch", "inglese", "englanti"],
+    "fr": ["french", "français", "francais", "francés", "frances", "französisch", "francese"],
+    "de": ["german", "deutsch", "allemand", "alemán", "aleman", "tedesco", "saksa"],
+    "es": ["spanish", "español", "espanol", "espagnol", "spanisch", "spagnolo", "castellano"],
+    "it": ["italian", "italiano", "italien", "italienisch"],
+    "fi": ["finnish", "suomi", "suomeksi", "suomenkielinen", "finnois", "finnisch"],
+    "pt": ["portuguese", "português", "portugues", "portugais", "portugiesisch"],
+    "nl": ["dutch", "nederlands", "néerlandais", "hollandais", "niederländisch", "holandés"],
+    "zh": ["chinese", "中文", "汉语", "漢語", "chinois", "chino", "chinesisch", "cinese"],
+    "ru": ["russian", "русский", "русском", "russe", "ruso", "russisch", "russo"],
+    "la": ["latin", "latín", "lateinisch", "latino", "latina"],
+    "el": ["greek", "ελληνικά", "grec", "griego", "griechisch", "greco"],
+    "ja": ["japanese", "日本語", "japonais", "japonés", "japanisch"],
+    "ar": ["arabic", "عربي", "العربية", "arabe", "árabe", "arabisch"],
+    "eo": ["esperanto"],
+    "ca": ["catalan", "català", "catalán"],
+    "tl": ["tagalog", "filipino"],
+    "enm": ["middle english"],
+}
+# Words that make a language name a request for that language ("in French", "en français",
+# "the original German", "French edition"), as opposed to a nationality ("Russian novels").
+LANGUAGE_CUE = (
+    r"\b(?:in|en|auf|em|na|op|language|langue|idioma|sprache|kieli|kielellä|original|"
+    r"translation|translated|written|version|edition|books?|livres?|libros?|bücher)\b"
+)
+
+
+def keep_requested_languages(plan: SearchPlan, messages: list[ChatMessage]) -> SearchPlan:
+    """Drops language filters the user did not ask for.
+
+    The model tends to filter on the language the user writes in ("Recommande-moi un roman
+    policier" -> French books only) or on a nationality ("Russian literature" -> Russian).
+    A language stays only when the message names it as a language.
+    """
+    text = request_text(plan, messages).casefold()
+    kept = [code for code in plan.languages if language_requested(code, text)]
+    if kept != plan.languages:
+        logger.info("Dropped language filter not requested: %s", plan.languages)
+    return plan.model_copy(update={"languages": kept})
+
+
+def language_requested(code: str, text: str) -> bool:
+    names = LANGUAGE_NAMES.get(code)
+    if names is None:
+        return True  # a language this table does not know: trust the model
+    name = "(?:" + "|".join(map(re.escape, names)) + ")"
+    # "in French", "written in French", "French edition", "Italian books"; whole words only.
+    before = rf"{LANGUAGE_CUE}\W+(?:\w+\W+){{0,2}}{name}(?![a-zà-ÿ])"
+    # "French edition", and "Italian books": in this catalogue that means books in Italian.
+    qualifier = (
+        r"(?:language|edition|version|translation|original|langue|idioma|sprache|"
+        r"books?|novels?|poetry|poems?|stories|titles?)"
+    )
+    after = rf"(?<![a-zà-ÿ]){name}\W+(?:\w+\W+)?{qualifier}\b"
+    return bool(re.search(before, text) or re.search(after, text))
 
 
 def mentioned(words: list[str], said: set[str]) -> bool:

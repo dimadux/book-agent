@@ -5,7 +5,12 @@ import pytest
 from backend.app.services.agent import plan, search
 from backend.app.services.agent.conversation import HISTORY_WINDOW
 from backend.app.services.agent.models import SearchPlan
-from backend.app.services.agent.plan import Decision, keep_mentioned_names, sanitize
+from backend.app.services.agent.plan import (
+    Decision,
+    keep_mentioned_names,
+    keep_requested_languages,
+    sanitize,
+)
 from tests.conftest import book_request, message
 
 
@@ -125,6 +130,41 @@ def test_exclusions_count_from_the_whole_conversation():
         SearchPlan(query="q", exclude_authors=["Dickens, Charles"]), history
     )
     assert kept.exclude_authors == ["Dickens, Charles"]
+
+
+def test_language_filter_needs_a_language_request():
+    def kept(languages, text):
+        plan = SearchPlan(query="q", languages=languages)
+        return keep_requested_languages(plan, [message("user", text)]).languages
+
+    assert kept(["fr"], "A detective novel in French") == ["fr"]
+    assert kept(["fr"], "Dumas in the original French") == ["fr"]
+    assert kept(["fr"], "Un roman en français") == ["fr"]
+    assert kept(["zh"], "Books written in Chinese") == ["zh"]
+    assert kept(["de"], "German edition of Faust") == ["de"]
+    assert kept(["it"], "Italian books") == ["it"]
+    assert kept(["en", "fi"], "Something in Finnish") == ["fi"]
+    # The language the user writes in, and nationalities, are not requests for a language.
+    assert kept(["fr"], "Recommande-moi un roman policier classique") == []
+    assert kept(["ru"], "Russian literature") == []
+    assert kept(["fr"], "Something by a French author") == []
+    assert kept(["xx"], "anything") == ["xx"]  # unknown to the table: trusted
+
+
+def test_language_from_an_earlier_turn_counts_for_a_follow_up():
+    history = [
+        message("user", "novels in German"),
+        message("assistant", "..."),
+        message("user", "more like those"),
+    ]
+    plan = SearchPlan(query="q", languages=["de"], follows_up=True)
+    assert keep_requested_languages(plan, history).languages == ["de"]
+    fresh = [
+        message("user", "novels in German"),
+        message("assistant", "..."),
+        message("user", "something gothic"),
+    ]
+    assert keep_requested_languages(plan, fresh).languages == []
 
 
 def test_plan_reaches_the_search(agent):

@@ -12,7 +12,7 @@ The entrypoint is `stream_book_agent_response()` in `backend/app/services/book_a
 
 ## Solution in short
 
-A stateless LangGraph pipeline behind the `/api/chat` SSE endpoint, with five steps: **plan** (one structured LLM call that gates intent and safety and extracts a store-agnostic `SearchPlan`), **similar** (for "books like X": looks X up in the catalogue and lets the LLM describe what it is like), **search** (Pinecone integrated-embedding search with metadata filters, relaxing constraints only when nothing matches), **rerank** (a cross-encoder shortlist when constraints were dropped) and **answer** (a streamed structured LLM reply, rendered to markdown as it arrives). Grounding is enforced in code: the model picks candidates by id, the book line is rendered from index data, and each pick must rate at least "partial" and quote evidence found in that book's data. Refusals, clarifications and error paths are fixed text. A typical request costs 2 LLM calls and 1 Pinecone search.
+A stateless LangGraph pipeline behind the `/api/chat` SSE endpoint, with five steps: **plan** (one structured LLM call that gates intent and safety and extracts a store-agnostic `SearchPlan`), **similar** (for "books like X": looks X up in the catalogue and lets the LLM describe what it is like), **search** (Pinecone integrated-embedding search with metadata filters, relaxing constraints only when nothing matches), **rerank** (a 16-book shortlist, reordered by a cross-encoder whenever the search returned more) and **answer** (a streamed structured LLM reply, rendered to markdown as it arrives). Grounding is enforced in code: the model picks candidates by id, the book line is rendered from index data, and each pick must rate at least "partial" and quote evidence found in that book's data. Refusals, clarifications and error paths are fixed text. A typical request costs 2 LLM calls and 1 Pinecone search.
 
 ## 1. The graph
 
@@ -101,14 +101,15 @@ Runs only when the plan names reference authors or titles.
 
 ### 3.4 Search: `agent/search.py`
 
-1. **Strict:** all constraints joined with `$and`, top 30. Most requests end here.
-2. **Relaxed, only if nothing matched:** every smaller set of constraints is searched **at once** (`asyncio.gather`), and the first set with results wins. The sets are ordered to drop as few constraints as possible, and the least important first: with years, language and author that is {language, author}, {years, author}, {years, language}, {author}, {language}, {years}, {}. Pinecone filters are strictly pass/fail, with no "optional filter" or should-clause, so this is how "drop as few constraints as possible" is expressed. The dropped constraints are reported as `relaxed_filters`.
+1. **Strict:** all constraints joined with `$and`, top 30 (`SEARCH_TOP_K`). A request without constraints fetches the top 100 instead (`BROAD_TOP_K`): there is no filter to narrow the pool, so the reranker gets a wide one. Most requests end here.
+2. **Relaxed, only if nothing matched:** every smaller set of constraints is searched **at once** (`asyncio.gather`), each fetching the top 100, and the first set with results wins. The sets are ordered to drop as few constraints as possible, and the least important first: with years, language and author that is {language, author}, {years, author}, {years, language}, {author}, {language}, {years}, {}. Pinecone filters are strictly pass/fail, with no "optional filter" or should-clause, so this is how "drop as few constraints as possible" is expressed. The dropped constraints are reported as `relaxed_filters`.
 
 Design points:
 
 - **One round trip for the fallback.** Up to 7 searches run in parallel, but only on the rare fallback path; a strict hit costs one call.
 - **Drop order: years → language → author.** Years are a soft preference and only approximated (below). The author goes last, because "books by X" is usually the point of the request.
 - **Year filters fall back to author life years.** `first_publish_year` is missing from the whole index (the Open Library enrichment was never run on it). So "before 1900" means `first_publish_year ≤ 1900 OR max_author_death_year ≤ 1900`, and "after 1900" means `… OR min_author_birth_year ≥ 1900`. An author who died before 1900 wrote before 1900.
+- **Author names are resolved to the catalogue's spelling before relaxing** (`resolve_authors`). Filters match exact strings, and the model writes "Dostoevsky, Fyodor", "Wells, H. G." or "Lovecraft, H. P." where the catalogue has "Dostoyevsky, Fyodor", "Wells, H. G. (Herbert George)". When a strict search with an author filter matches nothing, each name is searched as text (summaries name their authors), the authors of the books found are matched with `same_author` (word order, extra names, initials, accents and small spelling differences), and the strict search runs again with the catalogue names. The happy path stays one call; an unknown author costs one extra call and then relaxes as before. The resolved plan goes back into the state. The "books like X" lookup does the same for reference authors.
 - **The author name goes into the fallback query text**, because the fallback steps may not filter on it.
 - **Candidate clean-up** (`search`): drop books already recommended in this conversation, excluded titles (including longer full titles), excluded authors, and duplicate editions. Volumes of one edition ("[Vol. 8 of 9]") count as one work: the best-scoring record is kept.
 - **No repeats across turns.** Every recommended book is rendered with its Gutenberg link. The ids are read back from earlier assistant messages (`recommended_book_ids`) without an LLM call, and excluded. The history is client-controlled, but a forged link can only *exclude* a book.
@@ -117,10 +118,13 @@ Design points:
 
 ### 3.5 Rerank: `agent/rerank.py`
 
-- **Rerank only when it pays off:** when constraints were dropped (`relaxed_filters`) **and** there are more than 10 candidates. Then the pool is broad and vector order is least reliable. With 10 or fewer, the answer LLM can judge them all. Strict searches keep the fast path.
+- **Rerank whenever the pool is cut:** when the search returned more than the 16 candidates the answer weighs (`ANSWER_CANDIDATES`). The cut decides what the user gets, and vector order is the least reliable order there is; measured on the evaluation set, raw vector order missed well-known titles for broad themes. With 16 or fewer, the answer LLM judges them all and no reranker call is made, which is the usual case for a filtered search ("books by X").
 - **Cross-encoder, not an LLM.** `pinecone-rerank-v0` reads query and summary together and took ~0.7–1.2 s. `bge-reranker-v2-m3` took ~2.3 s. `cohere-rerank-3.5` is not authorized for this project. The answer step is already an LLM ranker that knows the flags, so a second LLM ranking would duplicate it and add a call.
-- **Crop by rank, not by score.** Vector scores are not comparable across queries (0.55 for Sherlock Holmes, −0.03 for French books), so a fixed threshold would drop everything for some queries. The top 30 go to the reranker.
-- **Popularity ordering happens after reranking** (`shortlist`), otherwise the reranker would overwrite it.
+- **Crop by rank, not by score.** Vector scores are not comparable across queries (0.55 for Sherlock Holmes, −0.03 for French books), so a fixed threshold would drop everything for some queries. Up to 100 books go to the reranker, which is also `pinecone-rerank-v0`'s per-call maximum; the top 16 go on.
+- **The reranker reads title, authors, subjects and summary** (`rerank_document`), cut to 1,000 characters: `pinecone-rerank-v0` rejects the whole request when one query+document pair exceeds 512 tokens (the earlier 1,500-character documents did, and the failures were silently caught).
+- **The reranker gets the user's own words**, not the plan's rewritten query, unless the request is a follow-up or a "books like X" (`rerank_query`). Cross-encoders are trained on short natural queries. Measured offline on the 25 theme cases of the evaluation set (recall@16 of the graded books): vector order 0.67; reranked with the plan's query 0.74 (pool 30) / 0.76 (pool 100); reranked with the user's words 0.74 / 0.79. `bge-reranker-v2-m3` ranked worse than vector order (0.54) and was dropped from consideration. A pool of 100 costs about one extra second over 30 for the last few points; `BROAD_TOP_K` is the knob.
+- **The reranker is rationed.** On the current Pinecone plan `pinecone-rerank-v0` allows 500 requests per month per organization and a per-minute limit, so reranking is a budget, not a given: one evaluation run uses about 60 calls. After any failed call, reranking pauses for 60 s (`RERANK_PAUSE_SECONDS`) and the search fetches 30 instead of 100, so an exhausted quota costs one failed call a minute and the agent otherwise behaves as before: vector order, 16 candidates.
+- **Popularity only orders the shortlist, it never selects it.** With `prefer_popular`, the 16 most relevant books are sorted by download count; before, the top 32 were sorted and cut to 16, which let well-known off-topic books push matching ones out (Crime and Punishment for "dystopian novel", The Odyssey for "Greek tragedy"). The plan also sets the flag only for explicit "popular", "famous" or "bestselling" requests, not for "classic" or a genre. Download counts are a weak signal in this index anyway: every record with a Gutenberg id above 78,000 shows 24–25K downloads.
 - If the reranker fails, the vector order is kept.
 
 ### 3.6 Answer: `agent/answer.py`
@@ -151,7 +155,7 @@ The README requires that the agent "never recommends books that were not retriev
 | **4. The justification is checked too** | `weak` picks are dropped, and the `evidence` must be found in that book's data | `AnswerRenderer._start_pick`, `is_grounded()` |
 | **5. Error paths stay grounded** | The fallback list shows retrieved books with their own summaries; refusals and "not in the catalogue" replies are fixed text | `answer_node`, `similar.py`, `plan.py` |
 
-The check is stricter than the README asks: ids are verified against the 10 candidates the answer step was given, not everything Pinecone returned. Live probes for books outside the catalogue (Harry Potter, The Hunger Games, 1984, Stephen King) all got an honest "not in the catalogue" reply.
+The check is stricter than the README asks: ids are verified against the 16 candidates the answer step was given, not everything Pinecone returned. Live probes for books outside the catalogue (Harry Potter, The Hunger Games, 1984, Stephen King) all got an honest "not in the catalogue" reply.
 
 **Remaining gap: free text.** The layers cover the *list* of recommendations. The model's free text around it (intro, reasons, closing) could still *name* a book that was not retrieved, e.g. "you might also enjoy Great Expectations". No id check can catch that. It did not happen in the probes, and the prompt allows only facts from the candidate data, but nothing in code prevents it. Options are listed in [Possible next steps](#8-possible-next-steps).
 
@@ -193,13 +197,14 @@ One LangGraph detail to know: a key returned by a node but not declared in `Agen
 |---|---|---|---|
 | `MAX_MESSAGE_CHARS` | 2000 | conversation | Longer messages are rejected before any LLM call. It is also the per-message cap on what LLMs see. |
 | `HISTORY_WINDOW` | 6 turns | conversation | What every LLM call sees. Enough to resolve follow-ups ("more like the second one") while keeping prompts small |
-| `SEARCH_TOP_K` | 30 | search | Enough to fill the reranker after exclusions and duplicate removal. Fewer than 30 matches from a filtered strict search means the result is exhaustive. |
-| `ANSWER_CANDIDATES` | 10 | rerank | Candidates the answer LLM weighs. Also the rerank threshold: with 10 or fewer, the answer judges all of them. |
+| `SEARCH_TOP_K` | 30 | search | A filtered search: room for duplicate editions, exclusions and books already shown, with no reranker call in the usual case. Fewer than 30 matches from a filtered strict search means the result is exhaustive. |
+| `BROAD_TOP_K` | 100 | search | An unfiltered or relaxed search: the reranker's pool, and its per-call maximum. |
+| `ANSWER_CANDIDATES` | 16 | rerank | Candidates the answer LLM weighs (about 5K prompt tokens). Also the rerank threshold: with 16 or fewer, the answer judges all of them. |
 | `RERANK_DOCUMENT_CHARS` | 1500 | rerank | Title + summary, within the reranker's input limit |
 | `MAX_PICKS` | 5 | answer | A readable reply. Fewer is fine when fewer fit. |
 | `MIN_EVIDENCE_COVERAGE` | 0.8 | answer | Share of the evidence's content words that must appear in the book's data. Real evidence measured 0.85–1.0, invented evidence 0–0.5. |
-| `SUMMARY_CHARS` | 700 | answer | 10 candidates × 700 chars keeps the answer prompt small. Summaries are short anyway. |
-| Popularity shortlist | top 20 → 10 | rerank | Relevance picks the shortlist first (2 × 10), so "popular" never means "popular but off-topic" |
+| `SUMMARY_CHARS` | 700 | answer | 16 candidates × 700 chars keeps the answer prompt small. Summaries are short anyway. |
+| Popularity shortlist | top 32 → 16 | rerank | Relevance picks the shortlist first (2 × 16), so "popular" never means "popular but off-topic" |
 | Fallback list | 3 books | answer | When the LLM fails, show a few safe picks with their own summaries |
 | `AUTHOR_LOOKUP_TOP_K` | 100 | similar | All books by up to 3 reference authors in one call |
 | `TITLE_LOOKUP_TOP_K` | 5 | similar | The title is usually first; a few extra cover duplicate editions |
@@ -212,7 +217,7 @@ Measured on this index (median of a few runs):
 | Operation | Time |
 |---|---|
 | One Pinecone search (the query is embedded on every call) | ~1.2 s (top 20) – ~1.7 s (top 100) |
-| Cross-encoder rerank of 30 | ~0.7–1.2 s |
+| Cross-encoder rerank of 30 / 100 | ~0.7–1.2 s / ~1–2 s |
 | Whole request, typical | 6–9 s, of which the streamed answer takes ~1.2 s |
 | "Books like X" | 8–12 s, with the note appearing after ~5–6 s |
 
@@ -241,12 +246,14 @@ Timeouts are constants, not variables: `LLM_TIMEOUT_SECONDS` (20), `SEARCH_TIMEO
 
 **Catalogue limits**
 - **1,000 books, mostly English, no publication years** (see [Constraints](#constraints)). Year filters approximate from author life years, and books with no author years never match a year filter.
+- **Author names are of poor quality.** Of the 1,000 records, 47 have no author at all (Beowulf, the Bible, anthologies), 13 are "Various", "Anonymous" or "Unknown", 31 list several people without saying who is author, co-author, editor or translator (Dumas with Maquet, Marco Polo with Rusticiano, Burns with his editor), 123 carry parenthesised expansions ("Wells, H. G. (Herbert George)"), a few are institutions ("Great Britain. War Office", "United States. Warren Commission"), and the spelling is Gutenberg's, which differs from common usage ("Dostoyevsky" for Dostoevsky, "Doyle, Arthur Conan" for Conan Doyle). Consequences: an author filter can only ever match the exact string, so the agent resolves names by a text search (3.4); books without an author never match an author or a year filter; "books by Dumas" also returns his collaborator's records; and "more by her" after an anthology has nothing to hold on to. The real fix is at ingest: one normalised author key per person, a role per name, and aliases.
 - **No length information.** "A short book" is silently ignored.
 - **Few books per author.** Most of the 633 authors have one or two titles, so author requests are often exhaustive, and "more" quickly reaches "already shown".
 - **Duplicate editions across languages** ("Crime and Punishment" and "El crimen y el castigo") are not merged and can take two of the 10 candidate slots.
 
 **Matching limits**
-- **Exact names only.** Author filters and the reference-author lookup need the exact Gutenberg form. "Conan Doyle, Arthur" does not match "Doyle, Arthur Conan". Pinecone filters have no partial, case-insensitive or regex matching (`$regex`, `$contains` and similar are rejected), and string ranges are not supported. The right fix is on the data side: store normalized author keys (surname, and a canonical "first last" form) as extra metadata at ingest, and have the plan step produce that key.
+- **Author names are resolved by a search, not by the filter.** Pinecone filters have no partial, case-insensitive or regex matching, so a name the model spells differently from the catalogue costs an extra text search to resolve (see 3.4). The resolution relies on summaries naming their authors; a data-side author key at ingest would make it a plain filter.
+- **A language filter needs a language request** (`keep_requested_languages`). The model filters on the language the user writes in ("Recommande-moi un roman policier" → French books only) and on nationalities ("Russian literature" → Russian). A language code survives only when the message names the language with a cue ("in French", "en français", "written in Chinese", "German edition", "Italian books"); the table covers the catalogue's languages in the main languages users write in, and unknown codes are trusted.
 - **Follow-up detection is English-only.** The back-reference words are English, so in another language a follow-up such as "more by him" loses names that were only in earlier turns. The search then falls back to the query text.
 - **Follow-ups rely on our links.** "Already recommended" is read from Gutenberg links in earlier replies. A client that strips them would see repeats.
 
@@ -263,4 +270,32 @@ Timeouts are constants, not variables: `LLM_TIMEOUT_SECONDS` (20), `SEARCH_TIMEO
 4. **Data-side fixes at ingest time** (see [Constraints](#constraints)): a normalized `title_key`, so titles can be matched by metadata filter instead of text search; normalized author keys and aliases, so "Dostoevsky" and "Dostoyevsky, Fyodor" meet without fuzzy matching in the agent; real publication years from Open Library, so the author-life-year approximation can go; a `work_key` shared by all editions, volumes and translations of a work, so duplicates are merged by filter rather than by title heuristics.
 5. Merge cross-language editions, or prefer the user's language (a `work_key` above covers this).
 6. Use a smaller, faster model for intent and filters if latency matters more than nuance.
-7. **Findings of the first evaluation run**, in order of impact: (a) the plan step sets a language filter from the language the user writes in ("Recommande-moi un roman policier" → `languages: ["fr"]`) although the prompt forbids it; (b) author names the model writes differently from the catalogue ("Dostoevsky, Fyodor", "Lovecraft, H. P.", "Wells, H. G.") miss the exact-match filter, so author requests come back with a wrong "couldn't find books matching your author filter" notice and "books like Lovecraft" answers "I don't have information about"; the data-side fix is item 4; (c) a reference named through a character or series ("something like Sherlock Holmes") is dropped by the name guard and the reference books come back as recommendations; (d) semantic retrieval misses well-known titles for broad themes ("dystopian" does not retrieve *We*; "Greek tragedy" only *Oedipus*), which the rerank step cannot repair because it only sees what was retrieved.
+7. **Open findings from the evaluation set** (the fixed ones are in the [decision log](#9-decision-log)): (a) a reference named through a character or series ("something like Sherlock Holmes") is dropped by the name guard and the reference books come back as recommendations; the fix is to have the plan return, with each reference, the exact words the user used for it, and to accept a multi-word title contained anywhere in a catalogue title; (b) "books like X" retrieval is weak when the similarity profile is generic prose ("like Jules Verne but in English" returns adventure books, Wells at rank 96); a better route is to use the reference books' own subjects and bookshelves as a filter or as query text; (c) the embedded text is only title and a 550-character summary, so thematic requests miss books whose summary does not use the theme's words (Moby Dick at rank 35–78 for "obsession and revenge" although its subjects say so); embedding subjects, bookshelves and an LLM-written themes line at ingest is the fix.
+
+## 9. Decision log
+
+Decisions taken on 2026-10-29 with the evaluation set (`make eval`, 70 cases) as the instrument. Each entry gives the evidence and what was rejected, so the same ground is not covered twice.
+
+| # | Decision | Evidence | Rejected |
+|---|---|---|---|
+| 1 | **Measure with graded relevance.** nDCG@5 of the picks is the headline; retrieval recall@10 of the candidates tells retrieval failures from answer-selection failures; forbidden and hallucinated ids and behaviour accuracy are hard checks. | First run: 51/70 passing, 11 cases failing in every run, each traced to a mechanism rather than to model noise. | An LLM judge: slower, costlier, and not needed when the expected books are known. |
+| 2 | **16 candidates to the answer step** (was 10). | On the 33 theme and "like X" cases, an ideal book was among the candidates in 29/33 cases with 10 and 33/33 with 16; about 2K more prompt tokens. | Fewer than 16 strict results (proposed 16): duplicates, exclusions and already-shown books are removed after the fetch, so a 16-fetch leaves 8 or fewer. Strict stays at 30. |
+| 3 | **Rerank whenever the pool is larger than the shortlist**, not only when constraints were dropped; a filtered search fetches 30, an unfiltered or relaxed one 100; the reranker gets the user's own words and a 1,000-character document. | Offline on 25 theme cases, recall@16: vector order 0.67; reranked with the plan's query 0.74 (pool 30) / 0.76 (pool 100); with the user's words 0.74 / 0.79. The 1,500-character documents made `pinecone-rerank-v0` reject about 1 request in 15 (512-token limit), silently. | `bge-reranker-v2-m3`: 0.54, worse than vector order. Reranking only above 30 candidates: the cut matters whenever the pool exceeds 16. A pool of 100 without a reranker: pure cost. |
+| 4 | **The reranker is rationed.** After a failed call, reranking pauses for 60 s and the search fetches 30. | The plan allows 500 rerank requests a month per organisation; one evaluation run uses about 60; the live eval could not confirm the offline gain before the quota ran out. | Retrying: the SDK already retries, and a monthly quota does not recover. |
+| 5 | **Popularity orders the shortlist, it never selects it**, and the plan sets `prefer_popular` only for explicit "popular / famous / bestselling" requests. | In every run the failing theme cases had candidates strictly ordered by downloads; raw search ranked *We* 2nd and *Medea* 2nd, both cut by the popularity sort. Download counts are also polluted: every id above 78,000 shows 24–25K. | A relevance–popularity blend over a wider pool: still lets a popular off-topic book in; not worth the complexity on this signal. |
+| 6 | **Author names are resolved by a text search when the filter finds nothing**, with fuzzy name matching; the resolved names go back into the plan. | "Dostoevsky", "H. G. Wells", "Lovecraft" failed 4/4 as author requests and as references; after the change all pass, at one extra call only on a miss. | Elasticsearch for its analyzers: at 1,000 books an in-process lookup gives the same result without new infrastructure. Ingest-time author keys: the right long-term fix (item 4 in section 8), not needed to unblock. |
+| 7 | **A language filter needs a language request**: a cue plus the language's name, in the language the user writes in. | "Recommande-moi un roman policier" got a French-only filter in 4/4 runs; "Russian literature" a Russian one in 2/4. | Prompt wording alone: it already forbade it. Dropping all language filters the model sets: "Italian books" and "in French" are real requests. |
+| 8 | **Stay on Pinecone for now.** | The failures that a lexical engine would fix (name variants, character names) were fixed in-process; the rest are plan-step or data problems that no engine fixes. | Elasticsearch / OpenSearch: worth it when the catalogue outgrows memory or when soft boosts and facets should live in the query language. |
+
+Effect on the evaluation set, same models (gpt-4.1-mini), reranker unavailable in the last run:
+
+| | before (morning) | after decisions 2–7 |
+|---|---|---|
+| pass rate | 56 / 70 | 67 / 70 |
+| nDCG@5 | 0.71 | 0.80 |
+| precision@5 | 0.88 | 0.93 |
+| retrieval recall@10 | 0.65 | 0.69 |
+| behaviour accuracy | 0.93 | 1.00 |
+| latency p50 | 6.3 s | 7.3 s |
+
+Of the three cases failing in that run, one is the character reference ("like Sherlock Holmes", open finding 7a in section 8), one a pick-quality case that fails about one run in four, and one ("Italian books") a guard bug fixed right after and passing on re-run.

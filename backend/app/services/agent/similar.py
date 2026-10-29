@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 from backend.app.services.agent.formatting import display_author, escape_markdown
 from backend.app.services.agent.llm import structured
 from backend.app.services.agent.models import AgentState, BookHit, SearchPlan
-from backend.app.services.agent.search import find_books, same_title
+from backend.app.services.agent.search import find_books, resolve_authors, same_author, same_title
 
 logger = logging.getLogger(__name__)
 
@@ -102,10 +102,19 @@ async def find_references(plan: SearchPlan) -> tuple[list[BookHit], list[str]]:
         *(find_books(title, None, TITLE_LOOKUP_TOP_K) for title in titles),
     )
 
+    unknown = [name for name in authors if not any(name in book.authors for book in by_author)]
+    if unknown:
+        # The exact lookup missed them: perhaps the catalogue spells the names differently.
+        resolved = await resolve_authors(unknown)
+        if resolved != unknown:
+            by_author += await find_books(
+                ", ".join(resolved), {"authors": {"$in": resolved}}, AUTHOR_LOOKUP_TOP_K
+            )
+
     books: list[BookHit] = []
     missing: list[str] = []
     for name in authors:
-        found = [book for book in by_author if name in book.authors]
+        found = [book for book in by_author if any(same_author(name, a) for a in book.authors)]
         books += found
         if not found:
             missing.append(display_author(name))

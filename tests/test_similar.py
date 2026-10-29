@@ -53,15 +53,17 @@ def test_unknown_reference_asks_for_the_mood(agent):
     fake = like(agent, book_request(query="q", similar_to_authors=["King, Stephen"]))
     out = agent.run("something like Stephen King")
     assert out.startswith("I don't have information about Stephen King") and "mood or vibe" in out
-    assert agent.catalogue.filters == [{"authors": {"$in": ["King, Stephen"]}}] and not fake.called(
-        Answer
-    )
+    # The exact lookup, then the name lookup that finds no catalogue spelling either.
+    assert agent.catalogue.filters == [{"authors": {"$in": ["King, Stephen"]}}, None]
+    assert not fake.called(Answer)
 
 
-def test_name_in_the_wrong_form_is_not_found(agent):
+def test_name_in_another_form_is_resolved(agent):
     agent.books(LIBRARY)
     state = run_similar(agent, SearchPlan(query="q", similar_to_authors=["Conan Doyle, Arthur"]))
-    assert "Arthur Conan Doyle" in state["reply"]
+    assert "reply" not in state
+    assert any("Baskervilles" in title for title in state["plan"].exclude_titles)
+    assert agent.catalogue.filters[-1] == {"authors": {"$in": ["Doyle, Arthur Conan"]}}
 
 
 def test_partly_known_references_continue(agent):
