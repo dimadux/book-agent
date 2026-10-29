@@ -204,6 +204,7 @@ def test_stream_cut_midway(agent):
         and "Carmilla" in out
         and "still streaming" not in out
         and answer.FALLBACK_INTRO not in out
+        and out.endswith(f"\n\n{answer.INTERRUPTED_NOTICE}")  # the cut is announced
     )
     fake = agent.llm({Answer: cut})
     fake.stream_fail_after = 60  # inside the intro: nothing was shown yet

@@ -1,6 +1,7 @@
 """Writes evals/dataset.json. Ids are plain Gutenberg numbers here and checked against the
 catalogue snapshot, so a typo fails loudly instead of silently lowering a score."""
 
+import collections
 import json
 import sys
 
@@ -1209,6 +1210,4 @@ case("behaviour_vague", "behaviour", "Recommend me a book", expect=["clarify", "
 
 json.dump(CASES, open(f"{ROOT}/evals/dataset.json", "w"), indent=1, ensure_ascii=False)
 print(len(CASES), "cases")
-import collections
-
 print(collections.Counter(c["category"] for c in CASES))

@@ -2,7 +2,8 @@
 
 Whenever the search returned more than the answer weighs, a cross-encoder reorders the pool
 first, because the cut decides what the user gets and vector order is the least reliable
-order there is. A pool the answer can take whole keeps the search order.
+order there is. A pool the answer can take whole, or a failed rerank call, keeps the search
+order.
 """
 
 from __future__ import annotations
@@ -10,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import time
 from functools import lru_cache
 
 from pinecone import Pinecone
@@ -27,11 +27,6 @@ ANSWER_CANDIDATES = 16
 # tokens; 1000 characters of English stays under that with the query.
 RERANK_DOCUMENT_CHARS = 1000
 RERANK_QUERY_CHARS = 300
-# After a failed call (rate limit, quota, outage) reranking is skipped for this long, so a
-# per-minute limit is respected and an exhausted monthly quota costs one failed call a minute.
-RERANK_PAUSE_SECONDS = 60
-
-_paused_until = 0.0
 
 
 @lru_cache
@@ -43,23 +38,15 @@ def get_rerank_model() -> str:
     return os.getenv("PINECONE_RERANK_MODEL", "pinecone-rerank-v0")
 
 
-def reranker_available() -> bool:
-    return time.monotonic() >= _paused_until
-
-
 async def rerank_node(state: AgentState) -> AgentState:
-    global _paused_until
     plan, candidates = state["plan"], state["books"]
     books = candidates
-    if len(books) > ANSWER_CANDIDATES and reranker_available():
+    if len(books) > ANSWER_CANDIDATES:
         try:
             query = rerank_query(plan, last_user_message(state["messages"]))
             books = await asyncio.to_thread(cross_encoder_order, query, books)
-        except Exception:
-            _paused_until = time.monotonic() + RERANK_PAUSE_SECONDS
-            logger.exception(
-                "Rerank failed; keeping the search order for %ss", RERANK_PAUSE_SECONDS
-            )
+        except Exception:  # rate limit, quota, outage: the vector order is still a ranking
+            logger.exception("Rerank failed; keeping the search order")
     shortlist = books[:ANSWER_CANDIDATES]
     if plan.prefer_popular:
         # Relevance picks the shortlist; popularity only orders it, so a well-known book that is

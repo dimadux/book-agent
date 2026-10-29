@@ -81,7 +81,7 @@ def test_an_unexpected_error_ends_with_the_error_reply(agent, monkeypatch):
     agent.books(GOTHIC)
     agent.llm({Decision: book_request(query="q"), Answer: reply(picks=[pick("gutenberg:4")])})
     out = agent.run("x")
-    # The fallback list had started (its intro is out) when the bug hit; the turn still ends cleanly.
+    # The fallback list had started (its intro is out) when the bug hit; the turn ends cleanly.
     assert out.startswith(answer.FALLBACK_INTRO) and out.endswith(f"\n\n{book_agent.ERROR_REPLY}")
 
 
@@ -94,5 +94,5 @@ def test_a_stuck_catalogue_call_gives_the_catalogue_reply(agent, monkeypatch):
 
     agent.books(stuck)
     agent.llm({Decision: book_request(query="q")})
-    # An empty result would give the no-results reply; the catalogue reply proves the deadline fired.
+    # An empty result would give the no-results reply; the catalogue reply proves the deadline.
     assert agent.run("x") == search.SEARCH_ERROR_REPLY

@@ -40,7 +40,7 @@ flowchart LR
 | `answer` | `agent/answer.py` | 1 (streamed) | – | Picks up to 5 books and streams the reply |
 | `reply` | `book_agent.py` | – | – | Writes a fixed reply (refusal, clarification, errors) |
 
-A typical request makes **2 LLM calls** (plan, then answer) and **1 Pinecone search**. "Books like X" adds one LLM call and one lookup round.
+A typical request makes **2 LLM calls** (plan, then answer), **1 Pinecone search** and, when the search returned more than 16 books (every request without filters), **1 rerank call**. "Books like X" adds one LLM call and one lookup round; an author the model spells differently from the catalogue adds one lookup.
 
 Shared modules: `models.py` (`SearchPlan`, `BookHit`, graph state), `conversation.py` (history helpers), `llm.py` (OpenAI client and the `structured()` call every step uses), `formatting.py` (markdown escaping).
 
@@ -51,8 +51,8 @@ Shared modules: `models.py` (`SearchPlan`, `BookHit`, graph state), `conversatio
 1. **plan** classifies the message as `book_request` and, in the same call, produces a plan with `similar_to_authors: ["Twain, Mark"]` and a first description of the request.
 2. The plan names a reference author, so the graph routes to **similar**.
 3. **similar** finds Twain's books with one exact metadata lookup. It sends their summaries, subjects and bookshelves to the LLM, which returns a search query ("humorous American adventure… darker tone") and a one-line note. The note is streamed to the user immediately. Twain is added to `exclude_authors`.
-4. **search** runs the strict search with the new query. It drops books already recommended earlier in the conversation, excluded titles and authors, and duplicate editions, and keeps up to 30.
-5. **rerank** sees a result that met every constraint, so it keeps the vector order and cuts the list to 10.
+4. **search** runs the search with the new query. It has no filters, so it fetches the top 100, then drops books already recommended earlier in the conversation, excluded titles and authors (Twain's own books among them), and duplicate editions.
+5. **rerank** sees more than 16 books, so the cross-encoder reorders them by the similarity query and the top 16 go on. If that call fails, the vector order stands.
 6. **answer** streams the reply. For each pick the model first commits to a fit rating and quotes evidence from that book's data; only checked picks are shown, with their reasons streaming as they arrive.
 
 ## 3. Steps and decisions
@@ -123,7 +123,7 @@ Design points:
 - **Crop by rank, not by score.** Vector scores are not comparable across queries (0.55 for Sherlock Holmes, −0.03 for French books), so a fixed threshold would drop everything for some queries. Up to 100 books go to the reranker, which is also `pinecone-rerank-v0`'s per-call maximum; the top 16 go on.
 - **The reranker reads title, authors, subjects and summary** (`rerank_document`), cut to 1,000 characters: `pinecone-rerank-v0` rejects the whole request when one query+document pair exceeds 512 tokens (the earlier 1,500-character documents did, and the failures were silently caught).
 - **The reranker gets the user's own words**, not the plan's rewritten query, unless the request is a follow-up or a "books like X" (`rerank_query`). Cross-encoders are trained on short natural queries. Measured offline on the 25 theme cases of the evaluation set (recall@16 of the graded books): vector order 0.67; reranked with the plan's query 0.74 (pool 30) / 0.76 (pool 100); reranked with the user's words 0.74 / 0.79. `bge-reranker-v2-m3` ranked worse than vector order (0.54) and was dropped from consideration. A pool of 100 costs about one extra second over 30 for the last few points; `BROAD_TOP_K` is the knob.
-- **The reranker is rationed.** On the current Pinecone plan `pinecone-rerank-v0` allows 500 requests per month per organization and a per-minute limit, so reranking is a budget, not a given: one evaluation run uses about 60 calls. After any failed call, reranking pauses for 60 s (`RERANK_PAUSE_SECONDS`) and the search fetches 30 instead of 100, so an exhausted quota costs one failed call a minute and the agent otherwise behaves as before: vector order, 16 candidates.
+- **The reranker is a budget, not a given.** On the current Pinecone plan `pinecone-rerank-v0` allows 500 requests per month per organization and a per-minute limit; one evaluation run uses about 60 calls. When a call fails (rate limit, exhausted quota, outage) the failure is logged and the vector order is kept: the top 16 of the pool as the search returned it. No state is kept about the failure, so the behaviour is the same on every turn and easy to reason about; an exhausted quota costs one failed call per reranked turn.
 - **Popularity only orders the shortlist, it never selects it.** With `prefer_popular`, the 16 most relevant books are sorted by download count; before, the top 32 were sorted and cut to 16, which let well-known off-topic books push matching ones out (Crime and Punishment for "dystopian novel", The Odyssey for "Greek tragedy"). The plan also sets the flag only for explicit "popular", "famous" or "bestselling" requests, not for "classic" or a genre. Download counts are a weak signal in this index anyway: every record with a Gutenberg id above 78,000 shows 24–25K downloads.
 - If the reranker fails, the vector order is kept.
 
@@ -141,7 +141,7 @@ Design points:
   - When filters were dropped, the fixed notice replaces the model's intro.
   - When the results are exhaustive, the model's closing is dropped. "There are no other books in the catalogue matching your request" is added only if every candidate was recommended.
 - **Escaping.** The frontend renders markdown as raw HTML, so every piece of book data and LLM text is escaped (`formatting.escape_markdown`, plus `escape_markdown_chunk` for streamed pieces).
-- **Failure paths.** If the stream fails before anything is shown, the top 3 candidates are listed with the first sentence of their summaries. If it fails mid-way, the partial answer stays. No candidates gives a fixed "couldn't find" reply.
+- **Failure paths.** If the stream fails before anything is shown, the top 3 candidates are listed with the first sentence of their summaries. If it fails mid-way, the partial answer stays. No candidates gives a fixed "couldn't find" reply. If it fails after part of the reply was shown, a fixed line says that the rest was cut off (`INTERRUPTED_NOTICE`), so the reply never just stops mid-sentence.
 
 ### 3.7 Grounding: never recommending books that were not retrieved
 
@@ -166,14 +166,14 @@ Every external call is a read, so retrying is safe; the risk is a call that neve
 | Budget | Value | Where | On expiry |
 |---|---|---|---|
 | One LLM attempt | 20 s (`LLM_TIMEOUT_SECONDS`) | `llm.py`, the shared client | the SDK retries once, then the step's own fallback applies |
-| Silence in the streamed answer | 20 s (same setting) | `answer.py` via the shared client | partial answer kept, or the fallback list if nothing was shown |
+| Silence in the streamed answer | 20 s (same setting) | `answer.py` via the shared client | partial answer kept and the cut announced, or the fallback list if nothing was shown |
 | One Pinecone search | 10 s (`SEARCH_TIMEOUT_SECONDS`) | `search.find_books` | "catalogue unavailable" reply; a reference lookup falls through to the plain search |
 | The whole turn | 45 s (`TURN_TIMEOUT_SECONDS`) | `book_agent.stream_book_agent_response` | a fixed "took too long" line, after whatever was already streamed |
 
 - **The stream always closes cleanly.** `stream_book_agent_response` wraps the graph run: a timeout or an unexpected exception is logged and ends the reply with a fixed line, so the client always receives the `done` frame instead of a broken connection.
-- **Model fallback.** `structured()` (plan and similar steps) tries `OPENAI_FALLBACK_MODEL` (default `gpt-4.1`) once when the primary model's call fails. A refusal or empty output is not retried: that is a decision about the input, not a transport failure. Set the variable empty to disable. The streamed answer has no model fallback; its failure path is the fallback list from the search results.
-- **Deterministic plans.** The plan and similarity calls run with `temperature=0`, so the same request gets the same filters. Models that reject the parameter (reasoning models) need it removed in `llm.py`.
-- **Per-step fallbacks** (unchanged): plan fails closed; reference lookup or description failure falls through to the plain search; rerank failure keeps vector order; answer failure lists the top 3 with their own summaries.
+- **Model fallback.** `structured()` (plan and similar steps) tries `OPENAI_FALLBACK_MODEL` (default `gpt-5.6-luna`) once when the primary model's call fails. A refusal or empty output is not retried: that is a decision about the input, not a transport failure. Set the variable empty to disable. The streamed answer has no model fallback; its failure path is the fallback list from the search results.
+- **Plans are not pinned.** The structured calls ran at `temperature=0` with the gpt-4.1 models; the current default models reject the parameter, so it was removed, and the same request can get a slightly different plan between runs (in four evaluation runs, two cases flipped on the plan alone). The guards in the plan step (names, languages, sanitising) bound what a flip can do.
+- **Per-step fallbacks** (unchanged): plan fails closed; reference lookup or description failure falls through to the plain search; rerank failure keeps vector order; answer failure lists the top 3 with their own summaries, or announces the cut when part of the reply was already shown.
 - A Pinecone call that exceeds its budget is abandoned, not cancelled: it runs in a thread and finishes on its own. The fan-out on the fallback path (up to 7 concurrent searches) is not capped yet.
 
 ## 4. State
@@ -200,7 +200,9 @@ One LangGraph detail to know: a key returned by a node but not declared in `Agen
 | `SEARCH_TOP_K` | 30 | search | A filtered search: room for duplicate editions, exclusions and books already shown, with no reranker call in the usual case. Fewer than 30 matches from a filtered strict search means the result is exhaustive. |
 | `BROAD_TOP_K` | 100 | search | An unfiltered or relaxed search: the reranker's pool, and its per-call maximum. |
 | `ANSWER_CANDIDATES` | 16 | rerank | Candidates the answer LLM weighs (about 5K prompt tokens). Also the rerank threshold: with 16 or fewer, the answer judges all of them. |
-| `RERANK_DOCUMENT_CHARS` | 1500 | rerank | Title + summary, within the reranker's input limit |
+| `RERANK_DOCUMENT_CHARS` | 1000 | rerank | Title, authors, subjects and summary. `pinecone-rerank-v0` rejects the whole request when one query+document pair exceeds 512 tokens; 1,500 characters did, silently. |
+| `RERANK_QUERY_CHARS` | 300 | rerank | The user's words as the rerank query, cut so that query plus document stay under the same limit |
+| `AUTHOR_RESOLVE_TOP_K` | 50 | search | Books searched by an author's name as text to learn the catalogue's spelling; summaries name their authors, so the right books are near the top |
 | `MAX_PICKS` | 5 | answer | A readable reply. Fewer is fine when fewer fit. |
 | `MIN_EVIDENCE_COVERAGE` | 0.8 | answer | Share of the evidence's content words that must appear in the book's data. Real evidence measured 0.85–1.0, invented evidence 0–0.5. |
 | `SUMMARY_CHARS` | 700 | answer | 16 candidates × 700 chars keeps the answer prompt small. Summaries are short anyway. |
@@ -216,10 +218,10 @@ Measured on this index (median of a few runs):
 
 | Operation | Time |
 |---|---|
-| One Pinecone search (the query is embedded on every call) | ~1.2 s (top 20) – ~1.7 s (top 100) |
-| Cross-encoder rerank of 30 / 100 | ~0.7–1.2 s / ~1–2 s |
-| Whole request, typical | 6–9 s, of which the streamed answer takes ~1.2 s |
-| "Books like X" | 8–12 s, with the note appearing after ~5–6 s |
+| One Pinecone search, any `top_k` | ~1.9 s median. The starter `search_books` builds a client and describes the index on every call; with a cached handle the same search takes ~0.2 s. The helper is part of the task and is left as is. |
+| Cross-encoder rerank of 30 / 100 | ~0.8 s / ~1.8 s |
+| Whole request (evaluation set, 70 cases) | p50 7.3–8.7 s, p95 12.8–15.7 s; the streamed answer itself takes ~1.2 s |
+| "Books like X" | 9–12 s, with the note appearing after ~5–6 s |
 
 ## 6. Configuration
 
@@ -228,8 +230,8 @@ Measured on this index (median of a few runs):
 | `PINECONE_API_KEY` | – | Search and rerank |
 | `PINECONE_INDEX_NAME`, `PINECONE_NAMESPACE` | `books`, `books-v1` | Which index to search |
 | `OPENAI_API_KEY` | – | All LLM steps |
-| `OPENAI_MODEL` | `gpt-4.1-mini` | All LLM steps |
-| `OPENAI_FALLBACK_MODEL` | `gpt-4.1` | Tried once when the primary model's call fails (plan and similar steps); empty disables |
+| `OPENAI_MODEL` | `gpt-5.6-terra` | All LLM steps. The evaluation numbers in section 9 marked gpt-4.1-mini were run with `OPENAI_MODEL=gpt-4.1-mini OPENAI_FALLBACK_MODEL=gpt-4.1` |
+| `OPENAI_FALLBACK_MODEL` | `gpt-5.6-luna` | Tried once when the primary model's call fails (plan and similar steps); empty disables |
 | `PINECONE_RERANK_MODEL` | `pinecone-rerank-v0` | Cross-encoder rerank |
 | `LOG_LEVEL` | `INFO` | Agent logs (intent, search plan, filters, rerank, dropped picks, timeouts), printed next to uvicorn's |
 
@@ -258,7 +260,7 @@ Timeouts are constants, not variables: `LLM_TIMEOUT_SECONDS` (20), `SEARCH_TIMEO
 - **Follow-ups rely on our links.** "Already recommended" is read from Gutenberg links in earlier replies. A client that strips them would see repeats.
 
 **Engineering**
-- **Tests run offline.** `make test` runs the pytest suite in `tests/`: a fake LLM that answers by schema and streams the answer JSON in pieces, and an in-memory catalogue with Pinecone's filter semantics (`tests/conftest.py`). One module per step (`test_plan.py`, `test_search.py`, `test_rerank.py`, `test_similar.py`, `test_answer.py`), `test_pipeline.py` for flows through the whole graph, and `test_reliability.py` for timeouts, the model fallback and the stream guard. Nothing talks to OpenAI or Pinecone, so the suite runs in under a second; behaviour against the live services was checked by hand.
+- **Tests run offline.** `make test` runs the pytest suite in `tests/`: a fake LLM that answers by schema and streams the answer JSON in pieces, and an in-memory catalogue with Pinecone's filter semantics (`tests/conftest.py`). One module per step (`test_plan.py`, `test_search.py`, `test_rerank.py`, `test_similar.py`, `test_answer.py`), `test_pipeline.py` for flows through the whole graph, and `test_reliability.py` for timeouts, the model fallback and the stream guard. Nothing talks to OpenAI or Pinecone, so the 82 tests run in a few seconds; behaviour against the live services is measured with the evaluation set below. One test still asserts `temperature=0` on the structured calls and fails since the parameter was removed with the model change; it should be dropped with the constant.
 - **Quality is measured against the live services.** `make eval` runs `evals/run_eval.py` over `evals/dataset.json`: 70 conversations with the books that should be recommended (graded, "ideal" counts double), books that must not appear, and the fixed reply expected for non-search turns. Relevance can be given as ids or as a metadata rule (`relevant_where: {"authors": [...]}`) resolved against `evals/catalogue.json`, a snapshot of the index (`--refresh-catalogue`). It reports nDCG@5, precision and recall of the picks, MRR, retrieval recall@10 of the candidates (to tell retrieval failures from answer-selection failures), forbidden and hallucinated ids, behaviour accuracy and latency, per category and overall, and compares two runs with `--baseline`. A case passes when behaviour matches, nothing forbidden or unknown was recommended and nDCG@5 is at least 0.5. The first run on the 1,000-book index passed 51 of 70; the failures are listed in [section 8](#8-possible-next-steps).
 - The OpenAI client is cached per process and bound to its event loop. That is fine under uvicorn; scripts calling `asyncio.run` several times need a fresh client.
 
@@ -281,21 +283,59 @@ Decisions taken on 2026-10-29 with the evaluation set (`make eval`, 70 cases) as
 | 1 | **Measure with graded relevance.** nDCG@5 of the picks is the headline; retrieval recall@10 of the candidates tells retrieval failures from answer-selection failures; forbidden and hallucinated ids and behaviour accuracy are hard checks. | First run: 51/70 passing, 11 cases failing in every run, each traced to a mechanism rather than to model noise. | An LLM judge: slower, costlier, and not needed when the expected books are known. |
 | 2 | **16 candidates to the answer step** (was 10). | On the 33 theme and "like X" cases, an ideal book was among the candidates in 29/33 cases with 10 and 33/33 with 16; about 2K more prompt tokens. | Fewer than 16 strict results (proposed 16): duplicates, exclusions and already-shown books are removed after the fetch, so a 16-fetch leaves 8 or fewer. Strict stays at 30. |
 | 3 | **Rerank whenever the pool is larger than the shortlist**, not only when constraints were dropped; a filtered search fetches 30, an unfiltered or relaxed one 100; the reranker gets the user's own words and a 1,000-character document. | Offline on 25 theme cases, recall@16: vector order 0.67; reranked with the plan's query 0.74 (pool 30) / 0.76 (pool 100); with the user's words 0.74 / 0.79. The 1,500-character documents made `pinecone-rerank-v0` reject about 1 request in 15 (512-token limit), silently. | `bge-reranker-v2-m3`: 0.54, worse than vector order. Reranking only above 30 candidates: the cut matters whenever the pool exceeds 16. A pool of 100 without a reranker: pure cost. |
-| 4 | **The reranker is rationed.** After a failed call, reranking pauses for 60 s and the search fetches 30. | The plan allows 500 rerank requests a month per organisation; one evaluation run uses about 60; the live eval could not confirm the offline gain before the quota ran out. | Retrying: the SDK already retries, and a monthly quota does not recover. |
+| 4 | **A failed rerank call keeps the vector order**, nothing more. | The plan allows 500 rerank requests a month per organisation; one evaluation run uses about 60; the live eval could not confirm the offline gain before the quota ran out. | A 60 s pause after a failure with a smaller fetch meanwhile: implemented first, then removed the same day, because it made the search's fetch size depend on a later step's failure state for a saving of one fast failing call per turn. Retrying: the SDK already retries, and a monthly quota does not recover. |
 | 5 | **Popularity orders the shortlist, it never selects it**, and the plan sets `prefer_popular` only for explicit "popular / famous / bestselling" requests. | In every run the failing theme cases had candidates strictly ordered by downloads; raw search ranked *We* 2nd and *Medea* 2nd, both cut by the popularity sort. Download counts are also polluted: every id above 78,000 shows 24–25K. | A relevance–popularity blend over a wider pool: still lets a popular off-topic book in; not worth the complexity on this signal. |
 | 6 | **Author names are resolved by a text search when the filter finds nothing**, with fuzzy name matching; the resolved names go back into the plan. | "Dostoevsky", "H. G. Wells", "Lovecraft" failed 4/4 as author requests and as references; after the change all pass, at one extra call only on a miss. | Elasticsearch for its analyzers: at 1,000 books an in-process lookup gives the same result without new infrastructure. Ingest-time author keys: the right long-term fix (item 4 in section 8), not needed to unblock. |
 | 7 | **A language filter needs a language request**: a cue plus the language's name, in the language the user writes in. | "Recommande-moi un roman policier" got a French-only filter in 4/4 runs; "Russian literature" a Russian one in 2/4. | Prompt wording alone: it already forbade it. Dropping all language filters the model sets: "Italian books" and "in French" are real requests. |
 | 8 | **Stay on Pinecone for now.** | The failures that a lexical engine would fix (name variants, character names) were fixed in-process; the rest are plan-step or data problems that no engine fixes. | Elasticsearch / OpenSearch: worth it when the catalogue outgrows memory or when soft boosts and facets should live in the query language. |
 
-Effect on the evaluation set, same models (gpt-4.1-mini), reranker unavailable in the last run:
+Effect on the evaluation set, same models (gpt-4.1-mini), reranker unavailable in the last run. The "after" column is the summary block of `evals/results/2026-10-29_agentfixes_gpt-4.1-mini.json`:
 
-| | before (morning) | after decisions 2–7 |
+| metric | before (run 14:38) | after decisions 2–7 |
 |---|---|---|
-| pass rate | 56 / 70 | 67 / 70 |
-| nDCG@5 | 0.71 | 0.80 |
-| precision@5 | 0.88 | 0.93 |
-| retrieval recall@10 | 0.65 | 0.69 |
+| cases passed | 56 / 70 (0.80) | 67 / 70 (0.957) |
 | behaviour accuracy | 0.93 | 1.00 |
+| nDCG@5 | 0.71 | 0.804 |
+| precision@5 | 0.88 | 0.935 |
+| recall@5 | 0.73 | 0.854 |
+| MRR | 0.93 | 0.984 |
+| retrieval recall@10 | 0.65 | 0.692 |
+| forbidden picks | 2 | 3 |
+| hallucinated ids | 0 | 0 |
+| errors / timeouts | 0 | 0 |
 | latency p50 | 6.3 s | 7.3 s |
+| latency p95 | 9.3 s | 12.8 s |
+
+The three forbidden picks are all Sherlock Holmes books for "something like Sherlock Holmes" (open finding 7a). The latency increase is the extra name-lookup call on author misses and the first, failing rerank attempt each minute while the quota is exhausted.
+
+A later run the same afternoon (`evals/results/2026-10-29T16-12.json`, commit `a1edfd5`, default models of the working tree; the results file does not record the model), the best so far:
+
+| category | cases | pass | nDCG@5 | P@5 | R@10 |
+|---|---|---|---|---|---|
+| author | 10 | 10 | 0.95 | 1.00 | 0.97 |
+| author+language | 2 | 2 | 1.00 | 1.00 | 1.00 |
+| behaviour | 8 | 8 | – | – | – |
+| constraint | 4 | 4 | 0.81 | 0.93 | 0.73 |
+| era | 3 | 3 | 0.78 | 0.93 | 0.63 |
+| followup | 4 | 4 | 0.79 | 0.95 | 0.69 |
+| language | 6 | 6 | 0.95 | 0.94 | 0.98 |
+| similar | 8 | 7 | 0.65 | 0.68 | 0.41 |
+| theme | 25 | 24 | 0.79 | 0.90 | 0.61 |
+
+| metric | value |
+|---|---|
+| cases passed | 68 / 70 (0.97) |
+| nDCG@5 | 0.82 |
+| precision@5 | 0.90 |
+| recall@5 | 0.85 |
+| MRR | 0.98 |
+| retrieval recall@10 | 0.70 |
+| behaviour accuracy | 0.99 |
+| forbidden picks | 0 |
+| hallucinated ids | 0 |
+| errors / timeouts | 0 |
+| latency p50 / p95 | 8.7 s / 15.7 s |
+
+Failing in that run: `theme_obsession_revenge`, `similar_sherlock_holmes`. "Books like X" remains the weakest category (retrieval recall 0.41): open findings 7a and 7b in section 8.
 
 Of the three cases failing in that run, one is the character reference ("like Sherlock Holmes", open finding 7a in section 8), one a pick-quality case that fails about one run in four, and one ("Italian books") a guard bug fixed right after and passing on re-run.

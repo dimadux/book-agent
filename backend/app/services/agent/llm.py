@@ -18,8 +18,6 @@ logger = logging.getLogger(__name__)
 # Per attempt; the SDK retries once more on connection errors, 429 and 5xx. For the streamed
 # answer it is the longest allowed silence between two chunks.
 LLM_TIMEOUT_SECONDS = 20
-# Classification and extraction should give the same plan for the same request.
-TEMPERATURE = 0
 DEFAULT_FALLBACK_MODEL = "gpt-5.6-luna"
 
 T = TypeVar("T", bound=BaseModel)
@@ -31,7 +29,7 @@ def get_llm_client() -> AsyncOpenAI:
 
 
 def get_llm_model() -> str:
-    return os.getenv("OPENAI_MODEL", "gpt-6-luna")
+    return os.getenv("OPENAI_MODEL", "gpt-5.6-terra")
 
 
 def llm_models() -> list[str]:

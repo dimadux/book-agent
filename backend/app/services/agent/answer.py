@@ -93,6 +93,7 @@ NO_RESULTS_REPLY = (
     "genre or mood differently, or name an author or a book you liked."
 )
 FALLBACK_INTRO = "Here are the closest matches I found in the catalogue:"
+INTERRUPTED_NOTICE = "Sorry, the rest of this reply was cut off. Please try again."
 
 # Words that say nothing about a book ("the", "with", "into").
 EVIDENCE_STOPWORDS = frozenset(
@@ -166,7 +167,10 @@ async def answer_node(state: AgentState) -> AgentState:
         await stream_answer(state, books, notes, renderer)
     except Exception:
         logger.exception("Answer generation failed")
-        if not renderer.wrote_anything:
+        if renderer.wrote_anything:
+            # The reply stops mid-sentence otherwise, with nothing to say why.
+            write(f"\n\n{INTERRUPTED_NOTICE}")
+        else:
             # Still answer from the search results, with their own summaries.
             write(f"{intro or FALLBACK_INTRO}\n\n")
             for position, book in enumerate(books[:3], start=1):

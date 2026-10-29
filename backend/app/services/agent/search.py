@@ -17,7 +17,6 @@ from typing import Any
 
 from backend.app.services.agent.conversation import recommended_book_ids
 from backend.app.services.agent.models import AgentState, BookHit, SearchPlan
-from backend.app.services.agent.rerank import reranker_available
 from backend.app.services.pinecone_utils import search_books
 
 logger = logging.getLogger(__name__)
@@ -79,9 +78,7 @@ async def search_node(state: AgentState) -> AgentState:
 
 async def search_with_relaxation(plan: SearchPlan, shown: frozenset[str]) -> SearchResult:
     constraints = plan_constraints(plan)
-    # A wide pool is only worth fetching when the reranker will narrow it.
-    broad = BROAD_TOP_K if reranker_available() else SEARCH_TOP_K
-    top_k = SEARCH_TOP_K if constraints else broad
+    top_k = SEARCH_TOP_K if constraints else BROAD_TOP_K
     books, matched = await search(plan, constraints, shown, top_k)
     if not matched and plan.authors:
         # Filters match exact strings, and the model may spell a name differently from the
@@ -108,7 +105,7 @@ async def search_with_relaxation(plan: SearchPlan, shown: frozenset[str]) -> Sea
         for size in range(len(constraints) - 1, -1, -1)
         for kept in combinations(reversed(constraints), size)
     ]
-    results = await asyncio.gather(*(search(plan, kept, shown, broad) for kept in subsets))
+    results = await asyncio.gather(*(search(plan, kept, shown, BROAD_TOP_K) for kept in subsets))
     for kept, (books, _) in zip(subsets, results, strict=True):
         if books:
             kept_names = {name for name, _ in kept}

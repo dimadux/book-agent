@@ -82,20 +82,13 @@ def test_popularity_never_replaces_a_relevant_book(monkeypatch):
     assert [b.title for b in state["books"]] == [f"Book {i}" for i in range(15, -1, -1)]
 
 
-def test_rerank_failure_keeps_the_search_order_and_pauses_reranking(monkeypatch):
-    calls = []
-
+def test_rerank_failure_keeps_the_search_order(monkeypatch):
     def failing(query, books):
-        calls.append(query)
         raise RuntimeError("rerank down")
 
     monkeypatch.setattr(rerank, "cross_encoder_order", failing)
-    monkeypatch.setattr(rerank, "_paused_until", 0.0)  # restored after the test
     state = run_rerank({"books": MANY, "relaxed_filters": ["author"]})
     assert [b.title for b in state["books"]] == [f"Book {i}" for i in range(16)]
-    assert not rerank.reranker_available()
-    run_rerank({"books": MANY})
-    assert len(calls) == 1  # no second attempt while paused
 
 
 def test_exhaustive_survives_only_when_nothing_is_cut():
