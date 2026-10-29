@@ -1,8 +1,7 @@
-"""Rerank node: shortlists the search candidates for the answer.
+"""Rerank node: shortlists the candidates for the answer.
 
-Search results are ordered by vector similarity. When they are degraded (the plan or the
-search fell back) and there are more than the answer can weigh, a cross-encoder reorders
-them first. Otherwise the vector order is kept.
+Vector order is kept unless constraints were dropped and the pool is broad: then the raw
+order is least reliable, and a cross-encoder reorders it first.
 """
 
 from __future__ import annotations
@@ -15,14 +14,12 @@ from functools import lru_cache
 from pinecone import Pinecone
 
 from backend.app.config import get_settings
-from backend.app.services.agent.models import BookHit, SearchPlan
-from backend.app.services.agent.state import AgentState
+from backend.app.services.agent.models import AgentState, BookHit
 
 logger = logging.getLogger(__name__)
 
-# The answer weighs at most this many books; above it, degraded results are reranked.
+# How many books the answer weighs.
 ANSWER_CANDIDATES = 10
-MAX_RERANK_DOCUMENTS = 30
 RERANK_DOCUMENT_CHARS = 1500
 
 
@@ -35,25 +32,22 @@ def get_rerank_model() -> str:
     return os.getenv("PINECONE_RERANK_MODEL", "pinecone-rerank-v0")
 
 
-def needs_rerank(state: AgentState) -> bool:
-    degraded = state.get("plan_degraded") or state.get("search_degraded")
-    return bool(degraded) and len(state.get("books") or []) > ANSWER_CANDIDATES
-
-
 async def rerank_node(state: AgentState) -> AgentState:
-    plan = state["plan"]
-    books = state.get("books") or []
-    ordered = books
-    if needs_rerank(state):
+    plan, candidates = state["plan"], state["books"]
+    books = candidates
+    if state.get("relaxed_filters") and len(books) > ANSWER_CANDIDATES:
         try:
-            ordered = await asyncio.to_thread(cross_encoder_order, plan.query, books[:MAX_RERANK_DOCUMENTS])
+            books = await asyncio.to_thread(cross_encoder_order, plan.query, books)
         except Exception:
             logger.exception("Rerank failed; keeping the search order")
-    shortlisted = shortlist(ordered, plan)
+    if plan.prefer_popular:
+        # Relevance picks the shortlist; popularity orders it.
+        books = sorted(books[: ANSWER_CANDIDATES * 2], key=lambda b: b.download_count, reverse=True)
+    shortlist = books[:ANSWER_CANDIDATES]
     return {
-        "books": shortlisted,
+        "books": shortlist,
         # Cutting the list means the answer no longer sees every matching book.
-        "books_exhaustive": bool(state.get("books_exhaustive")) and len(shortlisted) == len(books),
+        "exhaustive": state.get("exhaustive", False) and len(shortlist) == len(candidates),
     }
 
 
@@ -62,17 +56,10 @@ def cross_encoder_order(query: str, books: list[BookHit]) -> list[BookHit]:
     result = get_pinecone_client().inference.rerank(
         model=get_rerank_model(),
         query=query,
-        documents=[{"text": f"{book.title}\n{book.summary[:RERANK_DOCUMENT_CHARS]}"} for book in books],
+        documents=[{"text": f"{b.title}\n{b.summary[:RERANK_DOCUMENT_CHARS]}"} for b in books],
         rank_fields=["text"],
         top_n=len(books),
         return_documents=False,
     )
     logger.info("Reranked %d books with %s", len(books), get_rerank_model())
     return [books[ranked.index] for ranked in result.data]
-
-
-def shortlist(books: list[BookHit], plan: SearchPlan) -> list[BookHit]:
-    if plan.prefer_popular:
-        # Relevance picks the shortlist; popularity orders it.
-        books = sorted(books[: ANSWER_CANDIDATES * 2], key=lambda book: book.download_count, reverse=True)
-    return books[:ANSWER_CANDIDATES]

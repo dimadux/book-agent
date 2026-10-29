@@ -7,13 +7,13 @@ import re
 MARKDOWN_SPECIALS = re.compile(r"([\\`*_\[\]<>#|])")
 
 
-def escape_markdown(text: str) -> str:
-    return MARKDOWN_SPECIALS.sub(r"\\\1", " ".join(text.split()))
-
-
 def escape_markdown_chunk(text: str) -> str:
-    """Like escape_markdown, for one piece of streamed text: keeps spaces at the edges."""
+    """Escapes one piece of streamed text; spaces at its edges are kept."""
     return MARKDOWN_SPECIALS.sub(r"\\\1", re.sub(r"\s+", " ", text))
+
+
+def escape_markdown(text: str) -> str:
+    return escape_markdown_chunk(text).strip()
 
 
 def display_author(name: str) -> str:

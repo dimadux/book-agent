@@ -1,9 +1,9 @@
 """Similar node: for "books like X", finds X in the catalogue and searches for what it is like.
 
-Runs only when the plan names reference authors or titles. It looks the references up in
-the catalogue, asks the LLM what they share, streams a short note to the user and replaces
-the plan's query with that description. The references themselves are excluded from the
-results. When none of them is in the catalogue, it asks the user to describe the mood instead.
+Runs only when the plan names reference authors or titles. It looks them up, asks the LLM
+what they share, streams a one-line note to the user and replaces the plan's query with that
+description. The references themselves are excluded from the results. When none of them is
+in the catalogue, it asks the user to describe the mood instead.
 """
 
 from __future__ import annotations
@@ -11,22 +11,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections import Counter
-from dataclasses import dataclass, field
 
 from langgraph.config import get_stream_writer
 from pydantic import BaseModel, Field
 
-from backend.app.services.agent.conversation import recent_conversation
 from backend.app.services.agent.formatting import display_author, escape_markdown
-from backend.app.services.agent.llm import get_llm_client, get_llm_model
-from backend.app.services.agent.models import BookHit, SearchPlan
-from backend.app.services.agent.search import normalize_title, run_search, to_book_hit
-from backend.app.services.agent.state import AgentState
+from backend.app.services.agent.llm import structured
+from backend.app.services.agent.models import AgentState, BookHit, SearchPlan
+from backend.app.services.agent.search import find_books, same_title
 
 logger = logging.getLogger(__name__)
 
-SIMILAR_HISTORY_WINDOW = 6
 AUTHOR_LOOKUP_TOP_K = 100
 TITLE_LOOKUP_TOP_K = 5
 MAX_REFERENCE_BOOKS = 6
@@ -65,121 +60,66 @@ class SimilarityProfile(BaseModel):
     note: str = Field(description="One sentence for the user about the references.")
 
 
-@dataclass
-class References:
-    books: list[BookHit] = field(default_factory=list)
-    # Catalogue spellings of the reference authors that were found.
-    authors: list[str] = field(default_factory=list)
-    # Catalogue titles of the reference books that were found.
-    titles: list[str] = field(default_factory=list)
-    # References not in the catalogue, as the user named them.
-    missing: list[str] = field(default_factory=list)
-
-
 async def similar_node(state: AgentState) -> AgentState:
     plan = state["plan"]
     try:
-        references = await find_references(plan)
+        books, missing = await find_references(plan)
     except Exception:
-        # Search on the filter step's own description of the references instead.
         logger.exception("Reference lookup failed")
-        return {}
-
-    if not references.books:
+        return {}  # search on the plan's own description of the references instead
+    if not books:
         # The names come from the user's message and are shown as markdown, so escape them.
-        names = or_list([escape_markdown(name) for name in references.missing])
-        return {"reply": UNKNOWN_REFERENCE_REPLY.format(names=names)}
+        return {
+            "reply": UNKNOWN_REFERENCE_REPLY.format(
+                names=or_list([escape_markdown(n) for n in missing])
+            )
+        }
 
-    profile = await describe_references(state, references)
-    get_stream_writer()(f"*{escape_markdown(profile.note)}*\n\n")
-    logger.info("Similar to %s: %s", references.authors + references.titles, profile.query)
-    return {
-        "plan": plan.model_copy(
-            update={
-                "query": profile.query,
-                "exclude_titles": plan.exclude_titles + references.titles,
-                "exclude_authors": plan.exclude_authors + references.authors,
-            }
-        )
+    update = {  # the references themselves are never recommended back
+        "exclude_titles": plan.exclude_titles + [book.title for book in books],
+        "exclude_authors": plan.exclude_authors + plan.similar_to_authors,
     }
+    instructions = SIMILAR_INSTRUCTIONS.format(references=references_payload(books, missing))
+    profile = await structured(instructions, state["messages"], SimilarityProfile)
+    if profile and profile.query.strip():
+        get_stream_writer()(f"*{escape_markdown(profile.note)}*\n\n")
+        logger.info("Similar to %s: %s", [book.title for book in books], profile.query)
+        update["query"] = profile.query
+    return {"plan": plan.model_copy(update=update)}
 
 
-async def find_references(plan: SearchPlan) -> References:
-    author_books, *title_books = await asyncio.gather(
-        find_author_books(plan.similar_to_authors),
-        *(find_title_books(title) for title in plan.similar_to_titles),
+async def find_references(plan: SearchPlan) -> tuple[list[BookHit], list[str]]:
+    """Catalogue books for the plan's reference authors and titles, and the references not found
+    (as the user named them). All lookups run at once."""
+    authors, titles = plan.similar_to_authors, plan.similar_to_titles
+    by_author, *by_title = await asyncio.gather(
+        # One exact metadata lookup for all reference authors ("Last, First" as in the catalogue).
+        find_books(", ".join(authors), {"authors": {"$in": authors}}, AUTHOR_LOOKUP_TOP_K)
+        if authors
+        else asyncio.sleep(0, result=[]),
+        # Filters match exact values only, and catalogue titles are longer than what people
+        # write ("Frankenstein; or, The modern Prometheus"), so titles are searched by text.
+        *(find_books(title, None, TITLE_LOOKUP_TOP_K) for title in titles),
     )
 
-    references = References()
-    for name in plan.similar_to_authors:
-        by_author = [book for book in author_books if name in book.authors]
-        if by_author:
-            references.books += by_author
-            references.authors.append(name)
-        else:
-            references.missing.append(display_author(name))
-    for title, books in zip(plan.similar_to_titles, title_books, strict=True):
-        if books:
-            references.books += books
-            references.titles += [book.title for book in books]
-        else:
-            references.missing.append(title)
-
+    books: list[BookHit] = []
+    missing: list[str] = []
+    for name in authors:
+        found = [book for book in by_author if name in book.authors]
+        books += found
+        if not found:
+            missing.append(display_author(name))
+    for title, candidates in zip(titles, by_title, strict=True):
+        found = [book for book in candidates if same_title(title, book.title)]
+        books += found
+        if not found:
+            missing.append(title)
     # A book can be both by a reference author and a reference title.
-    unique = {book.id: book for book in references.books}
-    references.books = list(unique.values())[:MAX_REFERENCE_BOOKS]
-    return references
+    unique = list({book.id: book for book in books}.values())
+    return unique[:MAX_REFERENCE_BOOKS], missing
 
 
-async def find_author_books(names: list[str]) -> list[BookHit]:
-    """All reference authors in one exact metadata lookup ("Last, First" as in the catalogue)."""
-    if not names:
-        return []
-    matches = await run_search(", ".join(names), {"authors": {"$in": names}}, AUTHOR_LOOKUP_TOP_K)
-    return [book for book in map(to_book_hit, matches) if book is not None]
-
-
-async def find_title_books(title: str) -> list[BookHit]:
-    # Pinecone filters match exact values only, and catalogue titles are longer than the
-    # ones people write ("Frankenstein; or, The modern Prometheus"), so search by text.
-    wanted = normalize_title(title)
-    if not wanted:
-        return []
-    matches = await run_search(title, None, TITLE_LOOKUP_TOP_K)
-    books = [book for book in map(to_book_hit, matches) if book is not None]
-    return [book for book in books if is_same_title(wanted, book.title)]
-
-
-def is_same_title(wanted: str, catalogue_title: str) -> bool:
-    title = normalize_title(catalogue_title)
-    return title == wanted or title.startswith(f"{wanted} ")
-
-
-async def describe_references(state: AgentState, references: References) -> SimilarityProfile:
-    try:
-        response = await get_llm_client().responses.parse(
-            model=get_llm_model(),
-            instructions=SIMILAR_INSTRUCTIONS.format(references=references_payload(references)),
-            input=recent_conversation(state["messages"], SIMILAR_HISTORY_WINDOW),
-            text_format=SimilarityProfile,
-        )
-        if response.output_parsed and response.output_parsed.query.strip():
-            return response.output_parsed
-        logger.warning("Similarity description returned no profile")
-    except Exception:
-        logger.exception("Similarity description failed")
-    return fallback_profile(state["plan"], references)
-
-
-def fallback_profile(plan: SearchPlan, references: References) -> SimilarityProfile:
-    # The catalogue's own subjects describe the references well enough to search on.
-    subjects = Counter(subject for book in references.books for subject in book.subjects)
-    query = ", ".join([plan.query, *(subject for subject, _ in subjects.most_common(10))])
-    names = [display_author(name) for name in references.authors] + references.titles
-    return SimilarityProfile(query=query, note=f"I'll look for books similar to {or_list(names)}.")
-
-
-def references_payload(references: References) -> str:
+def references_payload(books: list[BookHit], missing: list[str]) -> str:
     return json.dumps(
         {
             "reference_books": [
@@ -190,9 +130,9 @@ def references_payload(references: References) -> str:
                     "subjects": book.subjects[:10],
                     "bookshelves": book.bookshelves[:8],
                 }
-                for book in references.books
+                for book in books
             ],
-            "not_in_catalogue": references.missing,
+            "not_in_catalogue": missing,
         },
         ensure_ascii=False,
     )

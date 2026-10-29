@@ -1,4 +1,4 @@
-.PHONY: setup run verify
+.PHONY: setup run verify test
 
 setup:
 	uv sync
@@ -11,3 +11,6 @@ run:
 
 verify:
 	uv run scripts/verify_setup.py
+
+test:
+	uv run pytest -q

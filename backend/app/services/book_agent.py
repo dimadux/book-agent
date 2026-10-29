@@ -1,3 +1,13 @@
+"""The book recommendation agent: a LangGraph pipeline that streams markdown to the chat UI.
+
+    plan ─► similar ─► search ─► rerank ─► answer ─► END
+      │        │          │
+      └────────┴──────────┴─► reply ─► END
+
+`reply` writes a fixed text for turns that end early: refusals, clarifying questions,
+references not in the catalogue, "nothing new to show", errors.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -9,12 +19,11 @@ from langgraph.graph import END, START, StateGraph
 
 from backend.app.schemas import ChatMessage
 from backend.app.services.agent.answer import answer_node
-from backend.app.services.agent.filters import extract_filters_node
-from backend.app.services.agent.intent import intent_node
+from backend.app.services.agent.models import AgentState
+from backend.app.services.agent.plan import plan_node
 from backend.app.services.agent.rerank import rerank_node
 from backend.app.services.agent.search import search_node
 from backend.app.services.agent.similar import similar_node
-from backend.app.services.agent.state import AgentState
 
 
 def configure_logging() -> None:
@@ -36,54 +45,37 @@ def configure_logging() -> None:
 configure_logging()
 
 
-async def join_node(state: AgentState) -> AgentState:
-    # Waits for intent and extract_filters, which run in parallel to save one LLM round trip.
-    return {}
-
-
-def route_after_join(state: AgentState) -> str:
-    if state.get("intent") != "book_request":
-        return "reply"
-    plan = state.get("plan")
-    # "Books like X": look X up first and search for what it is like.
-    if plan and (plan.similar_to_authors or plan.similar_to_titles):
-        return "similar"
-    return "search"
-
-
-def route_after_similar(state: AgentState) -> str:
-    # similar_node only sets a reply when none of the references is in the catalogue.
-    return "reply" if state.get("reply") else "search"
-
-
-def route_after_search(state: AgentState) -> str:
-    # search_node only sets a reply when the catalogue could not be queried.
-    return "reply" if state.get("reply") else "rerank"
-
-
 async def reply_node(state: AgentState) -> AgentState:
     get_stream_writer()(state["reply"])
     return {}
 
 
+def route_after_plan(state: AgentState) -> str:
+    if state.get("reply"):
+        return "reply"
+    plan = state["plan"]
+    # "Books like X": look X up first and search for what it is like.
+    return "similar" if plan.similar_to_authors or plan.similar_to_titles else "search"
+
+
+def unless_replied(next_node: str):
+    """Router for nodes that end the turn by setting `reply`, else continue to `next_node`."""
+    return lambda state: "reply" if state.get("reply") else next_node
+
+
 def build_graph():
     graph = StateGraph(AgentState)
-    graph.add_node("intent", intent_node)
-    graph.add_node("extract_filters", extract_filters_node)
-    graph.add_node("join", join_node)
+    graph.add_node("plan", plan_node)
     graph.add_node("similar", similar_node)
     graph.add_node("search", search_node)
     graph.add_node("rerank", rerank_node)
     graph.add_node("answer", answer_node)
     graph.add_node("reply", reply_node)
 
-    graph.add_edge(START, "intent")
-    graph.add_edge(START, "extract_filters")
-    # A list of sources makes join wait until both branches have finished.
-    graph.add_edge(["intent", "extract_filters"], "join")
-    graph.add_conditional_edges("join", route_after_join, ["similar", "search", "reply"])
-    graph.add_conditional_edges("similar", route_after_similar, ["search", "reply"])
-    graph.add_conditional_edges("search", route_after_search, ["rerank", "reply"])
+    graph.add_edge(START, "plan")
+    graph.add_conditional_edges("plan", route_after_plan, ["similar", "search", "reply"])
+    graph.add_conditional_edges("similar", unless_replied("search"), ["search", "reply"])
+    graph.add_conditional_edges("search", unless_replied("rerank"), ["rerank", "reply"])
     graph.add_edge("rerank", "answer")
     graph.add_edge("answer", END)
     graph.add_edge("reply", END)

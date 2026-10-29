@@ -22,5 +22,12 @@ openai = ["openai>=3.36.0"]
 anthropic = ["anthropic"]
 ollama = ["ollama"]
 
+[dependency-groups]
+dev = ["pytest>=8.3"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
 [tool.ruff]
 line-length = 100
