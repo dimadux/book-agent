@@ -20,6 +20,8 @@ from backend.app.services.pinecone_utils import search_books
 logger = logging.getLogger(__name__)
 
 SEARCH_TOP_K = 30
+# The SDK retries on its own; this keeps one stuck call from holding the whole turn.
+SEARCH_TIMEOUT_SECONDS = 10
 SEARCH_ERROR_REPLY = (
     "Sorry, the book catalogue is unavailable right now. Please try again in a moment."
 )
@@ -147,7 +149,9 @@ async def search(
 
 
 async def find_books(query: str, filters: Filter | None, top_k: int) -> list[BookHit]:
-    matches = await asyncio.to_thread(search_books, query, filters, top_k)
+    matches = await asyncio.wait_for(
+        asyncio.to_thread(search_books, query, filters, top_k), SEARCH_TIMEOUT_SECONDS
+    )
     logger.info("Search filters=%s returned %d matches", filters, len(matches))
     return [book for book in map(to_book_hit, matches) if book is not None]
 

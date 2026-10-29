@@ -172,8 +172,8 @@ def hits(records: list[dict[str, Any]]):
 class FakeStream:
     """Mimics responses.stream(): emits the answer JSON in small text deltas."""
 
-    def __init__(self, result, chunk: int = 7, fail_after: int | None = None):
-        self.result, self.chunk, self.fail_after = result, chunk, fail_after
+    def __init__(self, result, chunk: int = 7, fail_after: int | None = None, delay: float = 0.0):
+        self.result, self.chunk, self.fail_after, self.delay = result, chunk, fail_after, delay
 
     async def __aenter__(self):
         if isinstance(self.result, Exception):
@@ -187,6 +187,7 @@ class FakeStream:
         return self._events()
 
     async def _events(self):
+        await asyncio.sleep(self.delay)
         text = self.result.model_dump_json() if self.result is not None else ""
         for start in range(0, len(text), self.chunk):
             if self.fail_after is not None and start >= self.fail_after:
@@ -207,6 +208,8 @@ class FakeLLM:
         self.by_schema = responses
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.stream_fail_after: int | None = None
+        self.failing_models: set[str] = set()  # models whose calls raise, to test the fallback
+        self.delay: float = 0.0  # seconds each call takes, to test timeouts
 
     @property
     def responses(self):
@@ -214,6 +217,9 @@ class FakeLLM:
 
     async def parse(self, *, text_format, **kwargs):
         self.calls.append((text_format.__name__, kwargs))
+        await asyncio.sleep(self.delay)
+        if kwargs.get("model") in self.failing_models:
+            raise RuntimeError(f"{kwargs['model']} is down")
         result = self.by_schema.get(text_format)
         if isinstance(result, Exception):
             raise result
@@ -221,7 +227,9 @@ class FakeLLM:
 
     def stream(self, *, text_format, **kwargs):
         self.calls.append((text_format.__name__, kwargs))
-        return FakeStream(self.by_schema.get(text_format), fail_after=self.stream_fail_after)
+        return FakeStream(
+            self.by_schema.get(text_format), fail_after=self.stream_fail_after, delay=self.delay
+        )
 
     def called(self, schema: type) -> bool:
         return any(name == schema.__name__ for name, _ in self.calls)

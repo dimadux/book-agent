@@ -10,8 +10,10 @@ references not in the catalogue, "nothing new to show", errors.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import time
 from collections.abc import AsyncIterator
 
 from langgraph.config import get_stream_writer
@@ -43,6 +45,13 @@ def configure_logging() -> None:
 
 
 configure_logging()
+
+logger = logging.getLogger(__name__)
+
+# Wall-clock budget for one chat turn, all steps included.
+TURN_TIMEOUT_SECONDS = 45
+TIMEOUT_REPLY = "Sorry, that took too long. Please try again."
+ERROR_REPLY = "Sorry, something went wrong on my side. Please try again in a moment."
 
 
 async def reply_node(state: AgentState) -> AgentState:
@@ -86,6 +95,27 @@ book_agent_graph = build_graph()
 
 
 async def stream_book_agent_response(messages: list[ChatMessage]) -> AsyncIterator[str]:
-    """Run the LangGraph pipeline and stream the text chunks its nodes write."""
-    async for chunk in book_agent_graph.astream({"messages": messages}, stream_mode="custom"):
-        yield chunk
+    """Run the LangGraph pipeline and stream the text chunks its nodes write.
+
+    A turn that overruns its budget or hits an unexpected error ends with a fixed message
+    instead of a broken stream, so the client always gets a complete reply.
+    """
+    chunks = book_agent_graph.astream({"messages": messages}, stream_mode="custom")
+    deadline = time.monotonic() + TURN_TIMEOUT_SECONDS
+    streamed = False
+    try:
+        while True:
+            try:
+                chunk = await asyncio.wait_for(anext(chunks), deadline - time.monotonic())
+            except StopAsyncIteration:
+                return
+            streamed = True
+            yield chunk
+    except TimeoutError:
+        logger.warning("Turn timed out after %ss", TURN_TIMEOUT_SECONDS)
+        yield f"\n\n{TIMEOUT_REPLY}" if streamed else TIMEOUT_REPLY
+    except Exception:
+        logger.exception("Agent failed")
+        yield f"\n\n{ERROR_REPLY}" if streamed else ERROR_REPLY
+    finally:
+        await chunks.aclose()

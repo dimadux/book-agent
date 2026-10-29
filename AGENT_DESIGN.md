@@ -155,6 +155,23 @@ The check is stricter than the README asks: ids are verified against the 10 cand
 
 **Remaining gap: free text.** The layers cover the *list* of recommendations. The model's free text around it (intro, reasons, closing) could still *name* a book that was not retrieved, e.g. "you might also enjoy Great Expectations". No id check can catch that. It did not happen in the probes, and the prompt allows only facts from the candidate data, but nothing in code prevents it. Options are listed in [Possible next steps](#8-possible-next-steps).
 
+### 3.8 Reliability: budgets, fallbacks and the stream guard
+
+Every external call is a read, so retrying is safe; the risk is a call that never returns. The SDKs already retry (OpenAI once more, Pinecone up to three times with backoff), so the agent adds **deadlines**, not retry loops:
+
+| Budget | Value | Where | On expiry |
+|---|---|---|---|
+| One LLM attempt | 20 s (`LLM_TIMEOUT_SECONDS`) | `llm.py`, the shared client | the SDK retries once, then the step's own fallback applies |
+| Silence in the streamed answer | 20 s (same setting) | `answer.py` via the shared client | partial answer kept, or the fallback list if nothing was shown |
+| One Pinecone search | 10 s (`SEARCH_TIMEOUT_SECONDS`) | `search.find_books` | "catalogue unavailable" reply; a reference lookup falls through to the plain search |
+| The whole turn | 45 s (`TURN_TIMEOUT_SECONDS`) | `book_agent.stream_book_agent_response` | a fixed "took too long" line, after whatever was already streamed |
+
+- **The stream always closes cleanly.** `stream_book_agent_response` wraps the graph run: a timeout or an unexpected exception is logged and ends the reply with a fixed line, so the client always receives the `done` frame instead of a broken connection.
+- **Model fallback.** `structured()` (plan and similar steps) tries `OPENAI_FALLBACK_MODEL` (default `gpt-4.1`) once when the primary model's call fails. A refusal or empty output is not retried: that is a decision about the input, not a transport failure. Set the variable empty to disable. The streamed answer has no model fallback; its failure path is the fallback list from the search results.
+- **Deterministic plans.** The plan and similarity calls run with `temperature=0`, so the same request gets the same filters. Models that reject the parameter (reasoning models) need it removed in `llm.py`.
+- **Per-step fallbacks** (unchanged): plan fails closed; reference lookup or description failure falls through to the plain search; rerank failure keeps vector order; answer failure lists the top 3 with their own summaries.
+- A Pinecone call that exceeds its budget is abandoned, not cancelled: it runs in a thread and finishes on its own. The fan-out on the fallback path (up to 7 concurrent searches) is not capped yet.
+
 ## 4. State
 
 `AgentState` (`agent/models.py`) is a `TypedDict` without reducers: each node returns a partial update that overwrites those keys. The graph is a single path, so no two nodes ever write in the same step. There is no checkpointer: the browser sends the full history with every request, so the server is stateless.
@@ -207,8 +224,11 @@ Measured on this index (median of a few runs):
 | `PINECONE_INDEX_NAME`, `PINECONE_NAMESPACE` | `books`, `books-v1` | Which index to search |
 | `OPENAI_API_KEY` | – | All LLM steps |
 | `OPENAI_MODEL` | `gpt-4.1-mini` | All LLM steps |
+| `OPENAI_FALLBACK_MODEL` | `gpt-4.1` | Tried once when the primary model's call fails (plan and similar steps); empty disables |
 | `PINECONE_RERANK_MODEL` | `pinecone-rerank-v0` | Cross-encoder rerank |
-| `LOG_LEVEL` | `INFO` | Agent logs (intent, search plan, filters, rerank, dropped picks), printed next to uvicorn's |
+| `LOG_LEVEL` | `INFO` | Agent logs (intent, search plan, filters, rerank, dropped picks, timeouts), printed next to uvicorn's |
+
+Timeouts are constants, not variables: `LLM_TIMEOUT_SECONDS` (20), `SEARCH_TIMEOUT_SECONDS` (10), `TURN_TIMEOUT_SECONDS` (45). See [3.8](#38-reliability-budgets-fallbacks-and-the-stream-guard).
 
 ## 7. Known limitations
 
@@ -231,7 +251,7 @@ Measured on this index (median of a few runs):
 - **Follow-ups rely on our links.** "Already recommended" is read from Gutenberg links in earlier replies. A client that strips them would see repeats.
 
 **Engineering**
-- **Tests run offline.** `make test` runs the pytest suite in `tests/`: a fake LLM that answers by schema and streams the answer JSON in pieces, and an in-memory catalogue with Pinecone's filter semantics (`tests/conftest.py`). One module per step (`test_plan.py`, `test_search.py`, `test_rerank.py`, `test_similar.py`, `test_answer.py`) plus `test_pipeline.py` for flows through the whole graph. Nothing talks to OpenAI or Pinecone, so the suite runs in under a second; behaviour against the live services was checked by hand.
+- **Tests run offline.** `make test` runs the pytest suite in `tests/`: a fake LLM that answers by schema and streams the answer JSON in pieces, and an in-memory catalogue with Pinecone's filter semantics (`tests/conftest.py`). One module per step (`test_plan.py`, `test_search.py`, `test_rerank.py`, `test_similar.py`, `test_answer.py`), `test_pipeline.py` for flows through the whole graph, and `test_reliability.py` for timeouts, the model fallback and the stream guard. Nothing talks to OpenAI or Pinecone, so the suite runs in under a second; behaviour against the live services was checked by hand.
 - The OpenAI client is cached per process and bound to its event loop. That is fine under uvicorn; scripts calling `asyncio.run` several times need a fresh client.
 
 ## 8. Possible next steps

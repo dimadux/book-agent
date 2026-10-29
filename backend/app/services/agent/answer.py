@@ -258,9 +258,11 @@ class AnswerRenderer:
                     if book is None:
                         self.rejected.add(index)
                         continue
+                    # Rendered before the pick is recorded: a failed write shows nothing.
+                    heading = render_heading(len(self.picked) + 1, book)
+                    before = "\n" if self.picked else self._list_intro(answer)
                     self.picked[index] = book
-                    before = self._list_intro(answer) if len(self.picked) == 1 else "\n"
-                    self.write(before + render_heading(len(self.picked), book))
+                    self.write(before + heading)
                 self._stream(f"reason{index}", pick.get("reason"))
 
         # A closing follows the picks, or the model's own "nothing fits" intro.
