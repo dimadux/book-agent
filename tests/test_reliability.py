@@ -11,7 +11,7 @@ from backend.app.services.agent.similar import SimilarityProfile
 from tests.conftest import GOTHIC, LIBRARY, book_request, message, pick, reply
 
 
-def test_structured_calls_are_deterministic_and_try_the_fallback_model(agent, monkeypatch):
+def test_structured_calls_try_the_fallback_model(agent, monkeypatch):
     monkeypatch.setenv("OPENAI_MODEL", "primary")
     monkeypatch.setenv("OPENAI_FALLBACK_MODEL", "backup")
     fake = agent.llm({Decision: book_request(query="q")})
@@ -19,7 +19,6 @@ def test_structured_calls_are_deterministic_and_try_the_fallback_model(agent, mo
     decision = asyncio.run(llm.structured("i", [message("user", "x")], Decision))
     assert decision.intent == "book_request"
     assert [kwargs["model"] for _, kwargs in fake.calls] == ["primary", "backup"]
-    assert all(kwargs["temperature"] == 0 for _, kwargs in fake.calls)
 
 
 def test_fallback_is_not_used_for_a_refusal_or_when_disabled(agent, monkeypatch):

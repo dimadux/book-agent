@@ -13,7 +13,7 @@ import logging
 import os
 from functools import lru_cache
 
-from pinecone import Pinecone
+from pinecone import Pinecone, RetryConfig
 
 from backend.app.config import get_settings
 from backend.app.services.agent.conversation import last_user_message
@@ -27,21 +27,29 @@ ANSWER_CANDIDATES = 16
 # tokens; 1000 characters of English stays under that with the query.
 RERANK_DOCUMENT_CHARS = 1000
 RERANK_QUERY_CHARS = 300
+# One rerank call, no SDK retries: a 429 here is a per-minute or monthly quota, which does not
+# clear within a request, and the SDK's default of 3 retries with backoff cost 6 s per failure.
+RERANK_TIMEOUT_SECONDS = 5
 
 
 @lru_cache
 def get_pinecone_client() -> Pinecone:
-    return Pinecone(api_key=get_settings().pinecone_api_key)
+    return Pinecone(
+        api_key=get_settings().pinecone_api_key,
+        timeout=RERANK_TIMEOUT_SECONDS,
+        retry_config=RetryConfig(max_retries=0),
+    )
 
 
 def get_rerank_model() -> str:
+    """The cross-encoder model; empty disables reranking (e.g. while there is no quota)."""
     return os.getenv("PINECONE_RERANK_MODEL", "pinecone-rerank-v0")
 
 
 async def rerank_node(state: AgentState) -> AgentState:
     plan, candidates = state["plan"], state["books"]
     books = candidates
-    if len(books) > ANSWER_CANDIDATES:
+    if len(books) > ANSWER_CANDIDATES and get_rerank_model():
         try:
             query = rerank_query(plan, last_user_message(state["messages"]))
             books = await asyncio.to_thread(cross_encoder_order, query, books)

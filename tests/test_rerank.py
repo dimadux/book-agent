@@ -82,6 +82,16 @@ def test_popularity_never_replaces_a_relevant_book(monkeypatch):
     assert [b.title for b in state["books"]] == [f"Book {i}" for i in range(15, -1, -1)]
 
 
+def test_empty_rerank_model_disables_reranking(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        rerank, "cross_encoder_order", lambda query, books: calls.append(query) or books
+    )
+    monkeypatch.setenv("PINECONE_RERANK_MODEL", "")
+    state = run_rerank({"books": MANY})
+    assert not calls and [b.title for b in state["books"]] == [f"Book {i}" for i in range(16)]
+
+
 def test_rerank_failure_keeps_the_search_order(monkeypatch):
     def failing(query, books):
         raise RuntimeError("rerank down")
