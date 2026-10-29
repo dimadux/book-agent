@@ -6,7 +6,7 @@ The entrypoint is `stream_book_agent_response()` in `backend/app/services/book_a
 
 ## Constraints
 
-- **The index was rebuilt on my own Pinecone API key, with fewer books.** Gutendex, the source API, was unreliable and slow during development, so the `books-v1` namespace holds **100 books** instead of the ~1000 of the original assignment index. Everything below was tuned and measured on that smaller catalogue: author requests are often exhaustive, "more" quickly runs out, and some genres have only a handful of titles.
+- **The index was rebuilt on my own Pinecone API key, with fewer books.** Gutendex, the source API, was unreliable and slow during development, so the `books-v1` namespace was first rebuilt with 100 books and later with **1,000 books** (633 authors, 91% English, no publication years). The numbers below were tuned on the small catalogue and re-checked on the full one with the evaluation set (`make eval`).
 - **Pinecone metadata filtering is limited.** Filters are exact-value, pass/fail only: `$eq`/`$in` on strings and lists, numeric ranges, `$and`/`$or`. There is no partial, case-insensitive or regex match, no string ranges, and no "optional" or weighted clause. That is why the agent relaxes constraints by re-searching, matches titles by text rather than by filter, and needs the author name in the exact Gutenberg "Last, First" form.
 - **Some limitations belong on the data side, not in the search.** Author-name variability ("Conan Doyle, Arthur" vs "Doyle, Arthur Conan"), title matching, missing publication years and cross-language duplicate editions are best fixed at ingest time, by storing normalized keys and enriched fields in the index, rather than by more heuristics in the agent. The agent handles them only as far as a search-time workaround goes; the data-side fixes are listed in [Possible next steps](#8-possible-next-steps).
 
@@ -240,9 +240,9 @@ Timeouts are constants, not variables: `LLM_TIMEOUT_SECONDS` (20), `SEARCH_TIMEO
 - **Nothing on screen for the first ~5 s** while plan and search run. Only "books like X" shows an early note.
 
 **Catalogue limits**
-- **100 books, mostly English, no publication years** (see [Constraints](#constraints)). Year filters approximate from author life years, and books with no author years never match a year filter.
+- **1,000 books, mostly English, no publication years** (see [Constraints](#constraints)). Year filters approximate from author life years, and books with no author years never match a year filter.
 - **No length information.** "A short book" is silently ignored.
-- **Few books per author** (Twain 2, Shakespeare 4), so author requests are often exhaustive, and "more" quickly reaches "already shown".
+- **Few books per author.** Most of the 633 authors have one or two titles, so author requests are often exhaustive, and "more" quickly reaches "already shown".
 - **Duplicate editions across languages** ("Crime and Punishment" and "El crimen y el castigo") are not merged and can take two of the 10 candidate slots.
 
 **Matching limits**
@@ -252,6 +252,7 @@ Timeouts are constants, not variables: `LLM_TIMEOUT_SECONDS` (20), `SEARCH_TIMEO
 
 **Engineering**
 - **Tests run offline.** `make test` runs the pytest suite in `tests/`: a fake LLM that answers by schema and streams the answer JSON in pieces, and an in-memory catalogue with Pinecone's filter semantics (`tests/conftest.py`). One module per step (`test_plan.py`, `test_search.py`, `test_rerank.py`, `test_similar.py`, `test_answer.py`), `test_pipeline.py` for flows through the whole graph, and `test_reliability.py` for timeouts, the model fallback and the stream guard. Nothing talks to OpenAI or Pinecone, so the suite runs in under a second; behaviour against the live services was checked by hand.
+- **Quality is measured against the live services.** `make eval` runs `evals/run_eval.py` over `evals/dataset.json`: 70 conversations with the books that should be recommended (graded, "ideal" counts double), books that must not appear, and the fixed reply expected for non-search turns. Relevance can be given as ids or as a metadata rule (`relevant_where: {"authors": [...]}`) resolved against `evals/catalogue.json`, a snapshot of the index (`--refresh-catalogue`). It reports nDCG@5, precision and recall of the picks, MRR, retrieval recall@10 of the candidates (to tell retrieval failures from answer-selection failures), forbidden and hallucinated ids, behaviour accuracy and latency, per category and overall, and compares two runs with `--baseline`. A case passes when behaviour matches, nothing forbidden or unknown was recommended and nDCG@5 is at least 0.5. The first run on the 1,000-book index passed 51 of 70; the failures are listed in [section 8](#8-possible-next-steps).
 - The OpenAI client is cached per process and bound to its event loop. That is fine under uvicorn; scripts calling `asyncio.run` several times need a fresh client.
 
 ## 8. Possible next steps
@@ -262,3 +263,4 @@ Timeouts are constants, not variables: `LLM_TIMEOUT_SECONDS` (20), `SEARCH_TIMEO
 4. **Data-side fixes at ingest time** (see [Constraints](#constraints)): a normalized `title_key`, so titles can be matched by metadata filter instead of text search; normalized author keys and aliases, so "Dostoevsky" and "Dostoyevsky, Fyodor" meet without fuzzy matching in the agent; real publication years from Open Library, so the author-life-year approximation can go; a `work_key` shared by all editions, volumes and translations of a work, so duplicates are merged by filter rather than by title heuristics.
 5. Merge cross-language editions, or prefer the user's language (a `work_key` above covers this).
 6. Use a smaller, faster model for intent and filters if latency matters more than nuance.
+7. **Findings of the first evaluation run**, in order of impact: (a) the plan step sets a language filter from the language the user writes in ("Recommande-moi un roman policier" → `languages: ["fr"]`) although the prompt forbids it; (b) author names the model writes differently from the catalogue ("Dostoevsky, Fyodor", "Lovecraft, H. P.", "Wells, H. G.") miss the exact-match filter, so author requests come back with a wrong "couldn't find books matching your author filter" notice and "books like Lovecraft" answers "I don't have information about"; the data-side fix is item 4; (c) a reference named through a character or series ("something like Sherlock Holmes") is dropped by the name guard and the reference books come back as recommendations; (d) semantic retrieval misses well-known titles for broad themes ("dystopian" does not retrieve *We*; "Greek tragedy" only *Oedipus*), which the rerank step cannot repair because it only sees what was retrieved.

@@ -75,9 +75,9 @@ def unless_replied(next_node: str):
 def build_graph():
     graph = StateGraph(AgentState)
     graph.add_node("plan", plan_node)
-    graph.add_node("similar", similar_node)
+    graph.add_node("similar", similar_node) # optional
     graph.add_node("search", search_node)
-    graph.add_node("rerank", rerank_node)
+    graph.add_node("rerank", rerank_node) # optional
     graph.add_node("answer", answer_node)
     graph.add_node("reply", reply_node)
 

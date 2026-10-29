@@ -1,4 +1,4 @@
-.PHONY: setup run verify test
+.PHONY: setup run verify test eval
 
 setup:
 	uv sync
@@ -14,3 +14,6 @@ verify:
 
 test:
 	uv run pytest -q
+
+eval:
+	uv run python -m evals.run_eval

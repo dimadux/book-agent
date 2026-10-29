@@ -164,7 +164,10 @@ def iter_gutendex_books(
             sort=sort,
         )
         print(url)
-        payload = fetch_json(url)
+        try:
+            payload = fetch_json(url)
+        except:
+            continue
         results = payload.get("results", [])
         if not results:
             return
